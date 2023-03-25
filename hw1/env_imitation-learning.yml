@@ -32,3 +32,5 @@ dependencies:
     - swig==4.1.1
     - tqdm==4.65.0
     - wandb==0.14.0
+    - lightning==2.0.0
+    - lovely-tensors==0.1.14
