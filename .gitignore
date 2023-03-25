@@ -1,4 +1,7 @@
 **/.ipynb_checkpoints
 **/logdir
+**/wandb
+**/checkpoints
 hw1/train
 hw1/val
+
