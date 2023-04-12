@@ -5,6 +5,7 @@ channels:
   - conda-forge
 dependencies:  
   - ffmpeg=5.1.2 
+  - unzip=6.0
   - ipython=8.11.0  
   - ipywidgets=8.0.4  
   - jupyterlab=3.6.1
@@ -34,3 +35,5 @@ dependencies:
     - wandb==0.14.0
     - lightning==2.0.0
     - lovely-tensors==0.1.14
+    - lovely-numpy==0.2.8 
+    - pandas==2.0.0
