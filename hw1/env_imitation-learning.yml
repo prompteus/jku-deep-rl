@@ -37,3 +37,4 @@ dependencies:
     - lovely-tensors==0.1.14
     - lovely-numpy==0.2.8 
     - pandas==2.0.0
+    - papermill==2.4.0
