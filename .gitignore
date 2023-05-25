@@ -2,6 +2,6 @@
 **/logdir
 **/wandb
 **/checkpoints
-hw1/train
-hw1/val
-hw1/videos
+hw1-dagger/train
+hw1-dagger/val
+hw1-dagger/videos
