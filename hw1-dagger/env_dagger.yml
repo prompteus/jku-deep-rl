@@ -1,4 +1,4 @@
-name: drl-imitation-learning
+name: drl-dagger
 channels:
   - pytorch
   - nvidia
