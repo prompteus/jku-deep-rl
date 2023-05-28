@@ -11,10 +11,13 @@ def make_env_minigrid(**kwargs):
     return MinigridEmpty5x5ImgObs(**kwargs)
 
 def make_env_pong(**kwargs):
+    seed = kwargs.pop('seed', None)
     env_id = "PongNoFrameskip-v4"
     env = make_atari(env_id, **kwargs)
     env = wrap_deepmind(env)
     env = wrap_pytorch(env)
+    env.seed(seed)
+    env.action_space.seed(seed)
     return env
 
 
@@ -224,8 +227,8 @@ class LazyFrames(object):
     def __getitem__(self, i):
         return self._force()[i]
 
-def make_atari(env_id):
-    env = gym.make(env_id)
+def make_atari(env_id, **kwargs):
+    env = gym.make(env_id, **kwargs)
     assert 'NoFrameskip' in env.spec.id
     env = NoopResetEnv(env, noop_max=30)
     env = MaxAndSkipEnv(env, skip=4)
