@@ -3,6 +3,7 @@ import collections
 import gym
 import numpy as np
 import gym_minigrid
+import gym_minigrid.wrappers
 import cv2
 
 
