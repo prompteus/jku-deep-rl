@@ -2,6 +2,9 @@
 **/logdir
 **/wandb
 **/checkpoints
+**/lightning_logs
+**/__pycache__
 hw1-dagger/train
 hw1-dagger/val
 hw1-dagger/videos
+
