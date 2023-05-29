@@ -1,0 +1,31 @@
+training_env: "pong"
+model_config_name: "efficientnet-b0"
+
+accelerator: "cuda"
+precision: "16-mixed"
+max_steps: 5_000_000
+
+learning_rate: 0.0001
+batch_size: 256
+
+use_double_dqn: True
+epsilon_upper: 1.00
+epsilon_lower: 0.02
+# decay is done every time select_action during data collection,
+# but select_action is called once on whole mini-batch of N parallel envs at once,
+# so X decay steps means X*collect_data_num_parallel_envs total transitions 
+epsilon_decay_steps: 64_000 
+
+buffer_capacity: 128_000
+collect_data_num_parallel_envs: 10
+collect_data_every_n_steps: 500
+collect_data_num_steps_in_each_env: 3200
+# This means that loosely every pass through whole buffer,
+# we replace a quarter of the buffer with new data.
+# ("roughly" because the data is sampled from the buffer)
+
+valid_num_parallel_envs: 10
+valid_num_batches: 3
+val_check_interval: 3000
+
+early_stopping_threshold: 20.0
