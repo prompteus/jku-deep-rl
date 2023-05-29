@@ -1,28 +1,36 @@
 import collections
 
-import gym
+import gymnasium as gym
 import numpy as np
-import gym_minigrid
-import gym_minigrid.wrappers
+import minigrid
+import minigrid.wrappers
 import cv2
 
 
 def make_env_minigrid(**kwargs):
+    # seed is not needed for minigrid, it's deterministic
+    kwargs.pop('seed', None)    
+    if "render_mode" not in kwargs:
+        kwargs["render_mode"] = "rgb_array"
     return MinigridEmpty5x5ImgObs(**kwargs)
 
 def make_env_pong(**kwargs):
     seed = kwargs.pop('seed', None)
+    if "render_mode" not in kwargs:
+        kwargs["render_mode"] = "rgb_array"
     env_id = "PongNoFrameskip-v4"
     env = make_atari(env_id, **kwargs)
     env = wrap_deepmind(env)
     env = wrap_pytorch(env)
-    env.seed(seed)
-    env.action_space.seed(seed)
+    if seed is not None:
+        env.seed(seed)
+        env.action_space.seed(seed)
     return env
 
 
+
 class NoopResetEnv(gym.Wrapper):
-    def __init__(self, env: gym.Env, noop_max=30):
+    def __init__(self, env, noop_max=30):
         """Sample initial states by taking random number of no-ops on reset.
         No-op is assumed to be action 0.
         """
@@ -39,21 +47,23 @@ class NoopResetEnv(gym.Wrapper):
             noops = self.override_num_noops
         else:
             noops = self.unwrapped.np_random.integers(1, self.noop_max + 1)
-
-#            noops = self.unwrapped.np_random.randint(1, self.noop_max + 1) #pylint: disable=E1101
+#            noops = self.unwrapped.np_random.randint(1, self.noop_max + 1)  # pylint: disable=E1101
         assert noops > 0
         obs = None
         for _ in range(noops):
-            obs, _, done, _ = self.env.step(self.noop_action)
+#          state, reward, terminated, truncated, _
+            obs, _, terminated, truncated, info = self.env.step(self.noop_action)
+            done = terminated or truncated
             if done:
-                obs = self.env.reset(**kwargs)
+                obs, info = self.env.reset(**kwargs)
         return obs
 
     def step(self, ac):
         return self.env.step(ac)
 
+
 class FireResetEnv(gym.Wrapper):
-    def __init__(self, env: gym.Env):
+    def __init__(self, env):
         """Take action on reset for environments that are fixed until firing."""
         gym.Wrapper.__init__(self, env)
         assert env.unwrapped.get_action_meanings()[1] == 'FIRE'
@@ -61,16 +71,19 @@ class FireResetEnv(gym.Wrapper):
 
     def reset(self, **kwargs):
         self.env.reset(**kwargs)
-        obs, _, done, _ = self.env.step(1)
+        obs, _, terminated, truncated, info = self.env.step(1)
+        done = terminated or truncated
         if done:
             self.env.reset(**kwargs)
-        obs, _, done, _ = self.env.step(2)
+        obs, _, terminated, truncated, info = self.env.step(2)
+        done = terminated or truncated
         if done:
             self.env.reset(**kwargs)
-        return obs
+        return obs, info
 
     def step(self, ac):
         return self.env.step(ac)
+
 
 class EpisodicLifeEnv(gym.Wrapper):
     def __init__(self, env):
@@ -79,10 +92,11 @@ class EpisodicLifeEnv(gym.Wrapper):
         """
         gym.Wrapper.__init__(self, env)
         self.lives = 0
-        self.was_real_done  = True
+        self.was_real_done = True
 
     def step(self, action):
-        obs, reward, done, info = self.env.step(action)
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        done = terminated or truncated
         self.was_real_done = done
         # check current lives, make loss of life terminal,
         # then update lives to handle bonus lives
@@ -93,7 +107,7 @@ class EpisodicLifeEnv(gym.Wrapper):
             # the environment advertises done.
             done = True
         self.lives = lives
-        return obs, reward, done, info
+        return obs, reward, terminated, truncated, info
 
     def reset(self, **kwargs):
         """Reset only when lives are exhausted.
@@ -104,40 +118,40 @@ class EpisodicLifeEnv(gym.Wrapper):
             obs = self.env.reset(**kwargs)
         else:
             # no-op step to advance from terminal/lost life state
-            obs, _, _, _ = self.env.step(0)
+            obs, _, _, _, info = self.env.step(0)
         self.lives = self.env.unwrapped.ale.lives()
-        return obs
+        return obs, {}
+
 
 class MaxAndSkipEnv(gym.Wrapper):
     def __init__(self, env, skip=4):
         """Return only every `skip`-th frame"""
         gym.Wrapper.__init__(self, env)
         # most recent raw observations (for max pooling across time steps)
-        self._obs_buffer = np.zeros((2,)+env.observation_space.shape, dtype=np.uint8)
-        self._skip       = skip
-
-    def reset(self):
-        return self.env.reset()
+        self._obs_buffer = np.zeros((2,) + env.observation_space.shape, dtype=np.uint8)
+        self._skip = skip
 
     def step(self, action):
         """Repeat action, sum reward, and max over last observations."""
         total_reward = 0.0
         done = None
         for i in range(self._skip):
-            obs, reward, done, info = self.env.step(action)
+            obs, reward, terminated, truncated, info = self.env.step(action)
             if i == self._skip - 2: self._obs_buffer[0] = obs
             if i == self._skip - 1: self._obs_buffer[1] = obs
             total_reward += reward
+            done = terminated or truncated
             if done:
                 break
         # Note that the observation on the done=True frame
         # doesn't matter
         max_frame = self._obs_buffer.max(axis=0)
 
-        return max_frame, total_reward, done, info
+        return max_frame, total_reward, terminated, truncated, info
 
     def reset(self, **kwargs):
         return self.env.reset(**kwargs)
+
 
 class ClipRewardEnv(gym.RewardWrapper):
     def __init__(self, env):
@@ -147,6 +161,7 @@ class ClipRewardEnv(gym.RewardWrapper):
         """Bin reward to {+1, 0, -1} by its sign."""
         return np.sign(reward)
 
+
 class WarpFrame(gym.ObservationWrapper):
     def __init__(self, env):
         """Warp frames to 84x84 as done in the Nature paper and later work."""
@@ -154,12 +169,13 @@ class WarpFrame(gym.ObservationWrapper):
         self.width = 84
         self.height = 84
         self.observation_space = gym.spaces.Box(low=0, high=255,
-            shape=(self.height, self.width, 1), dtype=np.uint8)
+                                            shape=(self.height, self.width, 1), dtype=np.uint8)
 
     def observation(self, frame):
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
         frame = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_AREA)
         return frame[:, :, None]
+
 
 class FrameStack(gym.Wrapper):
     def __init__(self, env, k):
@@ -175,20 +191,21 @@ class FrameStack(gym.Wrapper):
         shp = env.observation_space.shape
         self.observation_space = gym.spaces.Box(low=0, high=255, shape=(shp[0], shp[1], shp[2] * k), dtype=np.uint8)
 
-    def reset(self):
-        ob = self.env.reset()
+    def reset(self, **kwargs):
+        ob, info = self.env.reset(**kwargs)
         for _ in range(self.k):
             self.frames.append(ob)
-        return self._get_ob()
+        return self._get_ob(), info
 
     def step(self, action):
-        ob, reward, done, info = self.env.step(action)
+        ob, reward, terminated, truncated, info = self.env.step(action)
         self.frames.append(ob)
-        return self._get_ob(), reward, done, info
+        return self._get_ob(), reward, terminated, truncated, info
 
     def _get_ob(self):
         assert len(self.frames) == self.k
         return LazyFrames(list(self.frames))
+
 
 class ScaledFloatFrame(gym.ObservationWrapper):
     def __init__(self, env):
@@ -198,6 +215,7 @@ class ScaledFloatFrame(gym.ObservationWrapper):
         # careful! This undoes the memory optimization, use
         # with smaller replay buffers only.
         return np.array(observation).astype(np.float32) / 255.0
+
 
 class LazyFrames(object):
     def __init__(self, frames):
@@ -226,6 +244,7 @@ class LazyFrames(object):
 
     def __getitem__(self, i):
         return self._force()[i]
+
 
 def make_atari(env_id, **kwargs):
     env = gym.make(env_id, **kwargs)
@@ -292,5 +311,5 @@ class MinigridEmpty5x5ImgObs(gym.Wrapper):
     """Minigrid with image observations provided by minigrid, partially observable."""
     def __init__(self, **kwargs):
         env = gym.make('MiniGrid-Empty-5x5-v0', **kwargs)
-        env = ScaledFloatFrame(ChannelFirst(gym_minigrid.wrappers.ImgObsWrapper(env)))
+        env = ScaledFloatFrame(ChannelFirst(minigrid.wrappers.ImgObsWrapper(env)))
         super().__init__(env)
