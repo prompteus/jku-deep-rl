@@ -310,6 +310,7 @@ class ScaledFloatFrame(gym.ObservationWrapper):
 class MinigridEmpty5x5ImgObs(gym.Wrapper):
     """Minigrid with image observations provided by minigrid, partially observable."""
     def __init__(self, **kwargs):
+        gym.register('MiniGrid-Empty-5x5-v0', entry_point="minigrid.envs:EmptyEnv")
         env = gym.make('MiniGrid-Empty-5x5-v0', **kwargs)
         env = ScaledFloatFrame(ChannelFirst(minigrid.wrappers.ImgObsWrapper(env)))
         super().__init__(env)
