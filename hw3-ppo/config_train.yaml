@@ -4,7 +4,6 @@ precision: "16-mixed"
 
 optimizer_class: "AdamW"
 learning_rate: 0.0001
-batch_size: 128
 
 hidden_dim: 512
 num_blocks: 5
@@ -12,11 +11,12 @@ num_blocks: 5
 importance_sampling_clip_range: [0.8, 1.2]
 
 buffer_capacity: 128000
-collect_data_num_parallel_envs: 10
-collect_data_every_n_updates: 10
-collect_data_num_steps: 256
+batch_size: 256
+collect_data_every_n_updates: 8
+collect_data_num_steps: 512
+collect_data_num_parallel_envs: 8
 
-val_check_interval: 5000
+val_check_interval: 10000
 valid_num_runs: 50
 valid_num_parallel_envs: 10
 
