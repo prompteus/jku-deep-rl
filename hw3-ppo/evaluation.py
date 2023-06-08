@@ -17,8 +17,8 @@ import argparse
 import os
 
 gymlogger.set_level(40)  # error only
-pydisplay = Display(visible=0, size=(640, 480))
-pydisplay.start()
+# pydisplay = Display(visible=0, size=(640, 480))
+# pydisplay.start()
 
 # Seed random number generators
 if os.path.exists("seed.rnd"):
@@ -117,6 +117,8 @@ if __name__ == "__main__":
         if seed is not None:
             seed = np.random.randint(1e7)
         scores.append(run_episode(agent, IMG_STACK, seed=seed))
+        print(scores)
+        print("Mean score: ", np.mean(scores))
 
     print(np.mean(scores))
 
