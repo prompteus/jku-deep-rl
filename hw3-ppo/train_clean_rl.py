@@ -96,29 +96,29 @@ def make_env(env_id, idx, capture_video, run_name, gamma):
     return thunk
 
 
-def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
-    torch.nn.init.orthogonal_(layer.weight, std)
-    torch.nn.init.constant_(layer.bias, bias_const)
-    return layer
+import models
 
 
 class Agent(nn.Module):
     def __init__(self, envs):
         super().__init__()
-        self.critic = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 512)),
-            nn.Tanh(),
-            layer_init(nn.Linear(512, 512)),
-            nn.Tanh(),
-            layer_init(nn.Linear(512, 1), std=1.0),
+        input_dim = np.array(envs.single_observation_space.shape).prod()
+        output_dim = np.prod(envs.single_action_space.shape)
+        self.critic = models.FeedForward(
+                input_dim=input_dim,
+                hidden_dim=64,
+                num_blocks=1,
+                use_skips=False,
+                output_dim=1,
+            )
+        self.actor_mean = models.FeedForward(
+            input_dim=input_dim,
+            hidden_dim=64,
+            num_blocks=1,
+            use_skips=False,
+            output_dim=output_dim,
         )
-        self.actor_mean = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 512)),
-            nn.Tanh(),
-            layer_init(nn.Linear(512, 512)),
-            nn.Tanh(),
-            layer_init(nn.Linear(512, np.prod(envs.single_action_space.shape)), std=0.01),
-        )
+        
         self.actor_logstd = nn.Parameter(torch.zeros(1, np.prod(envs.single_action_space.shape)))
 
     def get_value(self, x):
