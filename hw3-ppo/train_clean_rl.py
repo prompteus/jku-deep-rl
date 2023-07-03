@@ -44,7 +44,7 @@ def parse_args():
         help="the number of parallel game environments")
     parser.add_argument("--num-steps", type=int, default=2048,
         help="the number of steps to run in each environment per policy rollout")
-    parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
+    parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="Toggle learning rate annealing for policy and value networks")
     parser.add_argument("--gamma", type=float, default=0.99,
         help="the discount factor gamma")
@@ -119,19 +119,20 @@ class Agent(nn.Module):
             output_dim=output_dim,
         )
         
-        self.actor_logstd = nn.Parameter(torch.zeros(1, np.prod(envs.single_action_space.shape)))
+        self.actor_sigma = nn.Parameter(torch.full((1, output_dim), 0.55))
 
     def get_value(self, x):
         return self.critic(x)
 
     def get_action_and_value(self, x, action=None):
-        action_mean = self.actor_mean(x)
-        action_logstd = self.actor_logstd.expand_as(action_mean)
-        action_std = torch.exp(action_logstd)
-        probs = Normal(action_mean, action_std)
+        mu = self.actor_mean(x)
+        mu = torch.nn.functional.tanh(mu)
+        sigma = self.actor_sigma.expand_as(mu)
+        sigma = torch.nn.functional.softplus(sigma) + 1e-5
+        distr = torch.distributions.Normal(mu, sigma)
         if action is None:
-            action = probs.sample()
-        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(x)
+            action = distr.sample()
+        return action, distr.log_prob(action).sum(1), distr.entropy().sum(1), self.critic(x)
 
 
 if __name__ == "__main__":
