@@ -18,12 +18,12 @@ class FeedForward(torch.nn.Module):
         if squeeze_dim is None:
             squeeze_dim = hidden_dim
 
-        if input_dim is None or input_dim == hidden_dim:
+        if input_dim is None:
             self.layer_in = torch.nn.Identity()
         else:
             self.layer_in = torch.nn.Linear(input_dim, hidden_dim)
 
-        if output_dim is None or output_dim == hidden_dim:
+        if output_dim is None:
             self.layer_out = torch.nn.Identity()
         else:            
             self.layer_out = torch.nn.Linear(hidden_dim, output_dim)
@@ -32,10 +32,14 @@ class FeedForward(torch.nn.Module):
         self.blocks = torch.nn.ModuleList()
         self.layer_norms = torch.nn.ModuleList()
         for _ in range(num_blocks):
+            lin_out = torch.nn.Linear(squeeze_dim, hidden_dim)
+            if use_skips:
+                torch.nn.init.zeros_(lin_out.weight)
+                torch.nn.init.zeros_(lin_out.bias)
             block = torch.nn.Sequential(
                 torch.nn.Linear(hidden_dim, squeeze_dim),
                 torch.nn.ELU(),
-                torch.nn.Linear(squeeze_dim, hidden_dim),
+                lin_out,
                 torch.nn.ELU(),
             )
             self.blocks.append(block)
@@ -58,14 +62,14 @@ class ContinuousActor(torch.nn.Module):
         super().__init__()
         self.backbone = backbone
         self.layer_mu = torch.nn.LazyLinear(action_dim)
-        self.layer_sigma = torch.nn.LazyLinear(action_dim)
+        self.layer_sigma = torch.nn.Parameter(torch.full((1, action_dim), 0.55))
 
     def forward(self, x: torch.Tensor) -> torch.distributions.Distribution:
         x = self.backbone(x)
         mu_logits = self.layer_mu(x)
-        sigma_logits = self.layer_sigma(x)
         mu = torch.tanh(mu_logits)
-        sigma = torch.nn.functional.softplus(sigma_logits) + 1e-5
+        sigma = self.layer_sigma.expand_as(mu)
+        sigma = torch.nn.functional.softplus(sigma) + 1e-5
         distribution = torch.distributions.Normal(loc=mu, scale=sigma)
         distribution = torch.distributions.Independent(distribution, 1)
         # This is a gaussian distribution with diagonal covariance matrix
