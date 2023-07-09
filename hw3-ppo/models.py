@@ -1,73 +1,59 @@
 from __future__ import annotations
 import abc
+import math
 
+import numpy as np
 import torch
 
 
 class FeedForward(torch.nn.Module):
-    def __init__(
-        self,
-        hidden_dim: int,
-        num_blocks: int,
-        use_skips: bool,
-        input_dim=None,
-        output_dim=None,
-        squeeze_dim=None,
-    ) -> None:
+    def __init__(self, dims: list[int]) -> None:
         super().__init__()
-        if squeeze_dim is None:
-            squeeze_dim = hidden_dim
+        layers = []
+        for dim_in, dim_out in zip(dims[:-1], dims[1:]):
+            layers.append(torch.nn.Linear(dim_in, dim_out))
+            layers.append(torch.nn.Tanh())
+        layers.pop()
+        self.nn = torch.nn.Sequential(*layers)
+        self.init_weights()
 
-        if input_dim is None:
-            self.layer_in = torch.nn.Identity()
-        else:
-            self.layer_in = torch.nn.Linear(input_dim, hidden_dim)
-
-        if output_dim is None:
-            self.layer_out = torch.nn.Identity()
-        else:            
-            self.layer_out = torch.nn.Linear(hidden_dim, output_dim)
-
-        self.use_skips = use_skips
-        self.blocks = torch.nn.ModuleList()
-        self.layer_norms = torch.nn.ModuleList()
-        for _ in range(num_blocks):
-            lin_out = torch.nn.Linear(squeeze_dim, hidden_dim)
-            if use_skips:
-                torch.nn.init.zeros_(lin_out.weight)
-                torch.nn.init.zeros_(lin_out.bias)
-            block = torch.nn.Sequential(
-                torch.nn.Linear(hidden_dim, squeeze_dim),
-                torch.nn.ELU(),
-                lin_out,
-                torch.nn.ELU(),
-            )
-            self.blocks.append(block)
-            self.layer_norms.append(torch.nn.LayerNorm(hidden_dim))
-
+    def init_weights(self) -> None:
+        for layer in self.nn.modules():
+            if isinstance(layer, torch.nn.Linear):
+                torch.nn.init.orthogonal_(layer.weight, math.sqrt(2))
+                torch.nn.init.zeros_(layer.bias)
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.layer_in(x)
-        for block, layer_norm in zip(self.blocks, self.layer_norms):
-            if self.use_skips:
-                x = block(x) + x
-            else:
-                x = block(x)
-            x = layer_norm(x)
-        x = self.layer_out(x)
-        return x
+        return self.nn(x)
+
+
+class DiscreteActor(torch.nn.Module):
+    def __init__(self, dims: list[int]) -> None:
+        super().__init__()
+        self.nn = FeedForward(dims)
+
+    def init_weights(self) -> None:
+        torch.nn.init.orthogonal_(self.nn.nn[-1].weight, 0.01)
+
+    def forward(self, x: torch.Tensor) -> torch.distributions.Distribution:
+        logits = self.nn(x)
+        return torch.distributions.Categorical(logits=logits)
 
 
 class ContinuousActor(torch.nn.Module):
-    def __init__(self, backbone: torch.nn.Module, action_dim: int) -> None:
+    def __init__(self, dims: list[int]) -> None:
         super().__init__()
-        self.backbone = backbone
-        self.layer_mu = torch.nn.LazyLinear(action_dim)
-        self.layer_sigma = torch.nn.Parameter(torch.full((1, action_dim), 0.55))
+        self.nn_means = FeedForward(dims)
+        self.layer_sigma = torch.nn.Parameter(torch.ones(1, dims[-1]))
+        self.init_weights()
+
+    def init_weights(self) -> None:
+        torch.nn.init.orthogonal_(self.nn_means.nn[-1].weight, 0.01)
+        self.layer_sigma.data.fill_(1.0)
 
     def forward(self, x: torch.Tensor) -> torch.distributions.Distribution:
-        x = self.backbone(x)
-        mu_logits = self.layer_mu(x)
-        mu = torch.tanh(mu_logits)
+        x = self.nn_means(x)
+        mu = torch.tanh(x)
         sigma = self.layer_sigma.expand_as(mu)
         sigma = torch.nn.functional.softplus(sigma) + 1e-5
         distribution = torch.distributions.Normal(loc=mu, scale=sigma)
@@ -78,19 +64,24 @@ class ContinuousActor(torch.nn.Module):
 
 
 class Critic(torch.nn.Module):
-    def __init__(self, backbone: torch.nn.Module):
+    def __init__(self, dims: list[int]) -> None:
         super().__init__()
-        self.backbone = backbone
-        self.layer_value = torch.nn.LazyLinear(1)
+        self.nn = FeedForward(dims)
+        self.init_weights()
 
-    def forward(self, state: torch.Tensor) -> torch.Tensor:
-        state = self.backbone(state)
-        value = self.layer_value(state)
-        return value
+    def init_weights(self) -> None:
+        torch.nn.init.orthogonal_(self.nn.nn[-1].weight, 1.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.nn(x)
 
 
 class Agent(abc.ABC):
-    def select_action(self, state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def select_action(self, state: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         "Returns the action and the log probability of the action"
+        raise NotImplementedError
+    
+    def predict_value(self, state: np.ndarray) -> np.ndarray:
+        "Returns the value of the state"
         raise NotImplementedError
         
