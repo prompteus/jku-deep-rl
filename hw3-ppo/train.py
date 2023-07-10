@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import math
-import dataclasses
-from typing import Any, NamedTuple, Iterator, Iterable
-from lightning.pytorch.utilities.types import STEP_OUTPUT
+import functools
+from typing import Any, NamedTuple, Iterator, Iterable, Callable
 
 import torch
 import torch.utils.data
@@ -14,45 +13,82 @@ import lightning.pytorch.loggers
 import lightning.pytorch.callbacks
 import typer
 import torchdata.datapipes as dp
+import torchviz
 from torch import Tensor
 from torch.optim.optimizer import Optimizer
 from torch.distributions import Distribution
 from lovely_tensors import lovely
 
 from envs import create_env
-from models import FeedForward, ContinuousActor, Critic, Agent
+from models import Critic, ContinuousActor, DiscreteActor, Agent
 
 
 class Transition(NamedTuple):
     state: Tensor
+    value: Tensor
     action: Tensor
     reward: Tensor
-    next_state: Tensor
-    terminated: Tensor
-    truncated: Tensor
     log_prob: Tensor
-    future_return: Tensor
-    episodic_return: Tensor
-    episodic_length: Tensor
+    gae_advantage: Tensor
+    gae_return: Tensor
 
 
-@dataclasses.dataclass
-class Scaler:
-    negative_scale: float = 1.0
-    positive_scale: float = 1.0
-    min_clip: float = None
-    max_clip: float = None
+class Episode:
+    def __init__(self, gamma: float, gae_lambda: float) -> None:
+        self.gamma = gamma
+        self.gae_lambda = gae_lambda
+        self.states = []
+        self.values = None
+        self.actions = []
+        self.rewards = []
+        self.log_probs = []
+        self.ep_return = None
+        self.gae_advantages = []
+        self.truncated = None
 
-    def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        if self.negative_scale != 1.0:
-            x = torch.where(x < 0, x * self.negative_scale, x)
-        if self.positive_scale != 1.0:
-            x = torch.where(x > 0, x * self.positive_scale, x)
-        if self.min_clip is not None:
-            x = torch.where(x < self.min_clip, self.min_clip, x)
-        if self.max_clip is not None:
-            x = torch.where(x > self.max_clip, self.max_clip, x)
-        return x
+    def append(self, s, a, r, lp) -> None:
+        self.states.append(s)
+        self.actions.append(a)
+        self.rewards.append(r)
+        self.log_probs.append(lp)
+
+    def finish(self, agent: Agent, final_state, ep_return: float, truncated: bool) -> None:
+        self.states.append(final_state)
+        self.values = agent.predict_value(np.array(self.states))
+        if not truncated:
+            self.values[-1] = 0.0
+        self.ep_return = ep_return
+        self.truncated = truncated
+        self._compute_gae_advantages()
+
+    def _compute_gae_advantages(self) -> None:
+        rewards = np.array(self.rewards)
+        values = np.array(self.values)
+        td_targets = rewards + self.gamma * values[1:]
+        td_advantages = td_targets - values[:-1]
+        gae_advantages = [0.0] * len(values)
+        for t in reversed(range(len(gae_advantages) - 1)):
+            gae_advantages[t] = td_advantages[t] + self.gamma * self.gae_lambda * gae_advantages[t + 1]
+        self.gae_advantages = gae_advantages[:-1]
+
+    def __len__(self) -> int:
+        return len(self.actions)
+    
+    def to_transitions(self) -> Iterator[Transition]:
+        if self.ep_return is None:
+            raise ValueError("Episode not finished")
+        
+        for i in range(len(self)):
+            yield Transition(
+                state=self.states[i],
+                value=self.values[i],
+                action=self.actions[i],
+                reward=self.rewards[i],
+                log_prob=self.log_probs[i],
+                gae_advantage=self.gae_advantages[i],
+                gae_return=self.gae_advantages[i] + self.values[i],
+            )
+
 
 @torch.no_grad()
 def global_grad_norm(tensors: Iterable[Tensor]) -> Tensor:
@@ -62,46 +98,34 @@ def global_grad_norm(tensors: Iterable[Tensor]) -> Tensor:
 class PPO(lightning.LightningModule, Agent):
     def __init__(
         self,
-        backbone_config: dict[str, Any],
-        action_dim: int,
-        optimizer_config_actor: dict[str, Any] = dict(lr=1e-4),
-        optimizer_config_critic: dict[str, Any] = dict(lr=1e-4),
-        backbone_is_shared: bool = False,
+        architecture_dims: list[int],
+        epsilon,
+        entropy_coeff: float,
+        critic_coeff: float,
+        gamma: float,
+        critic_loss_fn: str,
+        lr_actor: float,
+        lr_critic: float,
+        #use_new_value_estimate: bool,
+        optimizer_config_actor: dict[str, Any] = dict(eps=1e-5),
+        optimizer_config_critic: dict[str, Any] = dict(eps=1e-5),
         optimizer_class: str = "Adam",
-        critic_loss_fn: str = "smooth_l1_loss",
-        epsilon: float = 0.1,
-        discount_factor: float = 0.99,
         normalize_advantage: bool = False,
-        entropy_coeff: float = 0.0,
-        critic_coeff: float = 0.5,
-        entropy_limit_steps: int = None,
-        reward_scaler_config: dict[str, Any] = None,
+        entropy_limit_steps: int = -1,
         clip_grad_norm_actor: float = None,
         clip_grad_norm_critic: float = None,
+        clip_grad_norm_total: float = None,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
 
-        if backbone_is_shared:
-            backbone = FeedForward(**backbone_config)
-            self.actor = ContinuousActor(backbone, action_dim)
-            self.critic = Critic(backbone)
-        else:
-            self.actor = ContinuousActor(FeedForward(**backbone_config), action_dim)
-            self.critic = Critic(FeedForward(**backbone_config))
-        
+        self.actor = DiscreteActor(architecture_dims)
+        self.critic = Critic(architecture_dims[:-1] + [1])
         self.critic_loss_fn = getattr(torch.nn.functional, critic_loss_fn)
         self.log_ratio_bounds: torch.Tensor
         self.register_buffer("log_ratio_bounds", torch.log1p(torch.tensor([-epsilon, epsilon])))
-        assert torch.allclose(
-            self.log_ratio_bounds.exp(),
-            torch.tensor([1-epsilon, 1+epsilon]),
-        )
-
-        if reward_scaler_config is None:
-            self.reward_scaler = torch.nn.Identity()
-        else:
-            self.reward_scaler = Scaler(**reward_scaler_config)
+        if clip_grad_norm_total is not None and (clip_grad_norm_critic is not None or clip_grad_norm_actor is not None):
+            raise ValueError("Cannot specify both clip_grad_norm_total and clip_grad_norm_critic/actor")
 
     def forward(self, x: Tensor) -> Tensor:
         return self.actor(x)
@@ -109,13 +133,13 @@ class PPO(lightning.LightningModule, Agent):
     def configure_optimizers(self):
         optimizer_class = getattr(torch.optim, self.hparams.optimizer_class)
         optimizer = optimizer_class([
-            {"params": self.actor.parameters(), **self.hparams.optimizer_config_actor},
-            {"params": self.critic.parameters(), **self.hparams.optimizer_config_critic},
+            {"params": self.actor.parameters(), "lr": self.hparams.lr_actor, **self.hparams.optimizer_config_actor},
+            {"params": self.critic.parameters(), "lr": self.hparams.lr_critic, **self.hparams.optimizer_config_critic},
         ])
         return optimizer
     
     def _entropy_coeff(self) -> float:
-        if self.hparams.entropy_limit_steps is None:
+        if self.hparams.entropy_limit_steps == -1:
             return self.hparams.entropy_coeff
         if self.global_step >= self.hparams.entropy_limit_steps:
             return 0.0
@@ -123,41 +147,40 @@ class PPO(lightning.LightningModule, Agent):
 
     def critic_loss(self, batch: Transition) -> tuple[Tensor, Tensor]:
         curr_value = self.critic(batch.state).flatten()
-        with torch.no_grad():
-            reward = self.reward_scaler(batch.reward)
-            next_value = self.critic(batch.next_state).flatten().detach()
-            td_target = (reward + (~batch.terminated) * self.hparams.discount_factor * next_value).detach()
-            td_advantage = (td_target - curr_value).detach()
-            if self.hparams.normalize_advantage:
-                td_advantage = self._normalize_advantage(td_advantage)
-        critic_td_loss = self.critic_loss_fn(curr_value, td_target.detach())
-        critic_td_loss = self.hparams.critic_coeff * critic_td_loss
-        return critic_td_loss, td_advantage
+        critic_td_loss = self.critic_loss_fn(curr_value, batch.gae_return)
+        critic_td_loss *= self.hparams.critic_coeff
+        return critic_td_loss
 
-    def actor_loss(self, batch: Transition, td_advantage: Tensor) -> tuple[Tensor, Tensor]:
-        distribution: Distribution = self.actor(batch.state)
-        log_prob = distribution.log_prob(batch.action)
-        log_ratio = log_prob - batch.log_prob
-        ratio = log_ratio.exp()
-        ratio_clipped = log_ratio.clamp(*self.log_ratio_bounds).exp()
-        surrogate = torch.min(ratio * td_advantage, ratio_clipped * td_advantage)
-        actor_ppo_loss = -torch.mean(surrogate)
-        entropy = distribution.entropy().mean(dim=0)
+    def actor_loss(self, batch: Transition) -> tuple[Tensor, Tensor]:
+        distr: Distribution = self.actor(batch.state)
+        log_prob = distr.log_prob(batch.action)
+        ratio = (log_prob - batch.log_prob).exp()
+        ratio_clipped = ratio.clamp(1-self.hparams.epsilon, 1+self.hparams.epsilon)
+        #assert (ratio_clipped >= 1 - self.hparams.epsilon - 0.0001).all()
+        #assert (ratio_clipped <= 1 + self.hparams.epsilon + 0.0001).all()
+        advantage = self._normalize_advantage(batch.gae_advantage)
+        surr_1 = advantage * ratio
+        surr_2 = advantage * ratio_clipped
+        surr = torch.min(surr_1, surr_2)
+        actor_ppo_loss = -surr.mean()
+        entropy = distr.entropy().mean(dim=0)
         self.log_dict({
             "importance_ratio_min": ratio.min(),
             "importance_ratio_max": ratio.max(),
-            "was_clipped": torch.isclose(ratio, ratio_clipped).float().mean(),
+            "ratio_outside_bounds": 1 - torch.isclose(ratio, ratio_clipped).float().mean(),
+            "clipped_fraction": torch.isclose(surr, surr_2).float().mean()
         })
         return actor_ppo_loss, entropy
 
     def entropy_loss(self, entropy: Tensor) -> Tensor:
         entropy_coeff = self._entropy_coeff()
-        entropy_loss = - entropy_coeff * entropy
+        entropy_loss = -entropy
+        entropy_loss *= entropy_coeff
         return entropy_loss, entropy_coeff
 
     def training_step(self, batch: Transition, batch_idx: int) -> Tensor:
-        critic_td_loss, td_advantage = self.critic_loss(batch)
-        actor_ppo_loss, entropy = self.actor_loss(batch, td_advantage)
+        critic_td_loss = self.critic_loss(batch)
+        actor_ppo_loss, entropy = self.actor_loss(batch)
         entropy_loss, entropy_coeff = self.entropy_loss(entropy)
         loss = actor_ppo_loss + critic_td_loss + entropy_loss
         self.log_dict({
@@ -167,163 +190,145 @@ class PPO(lightning.LightningModule, Agent):
             "actor_entropy_coeff": entropy_coeff,
             "actor_entropy": entropy,
             "critic_loss_coeff": self.hparams.critic_coeff,
-            "td_advantage": td_advantage.mean(),
+            "gae_advantage": batch.gae_advantage.mean(),
             "total_loss": loss,
         })
+        
+        # Check if losses don't send gradients to the wrong network:
+        # torchviz.make_dot(loss, params=dict(self.named_parameters()))
+        # torch.autograd.grad(actor_ppo_loss, self.critic.parameters(), allow_unused=True)
+        # torch.autograd.grad(entropy_loss, self.critic.parameters(), allow_unused=True)
+        # torch.autograd.grad(critic_td_loss, self.actor.parameters(), allow_unused=True)
         return loss
 
-    def _normalize_advantage(self, td_advantage: Tensor) -> Tensor:
-        if self.hparams.normalize_advantage and td_advantage.numel() > 1:
-            with torch.no_grad():
-                loc = td_advantage.mean().item()
-                scale = td_advantage.std().clamp_min(1e-6).item()
-                return (td_advantage - loc) / scale
-        return td_advantage
+    def _normalize_advantage(self, advantage: Tensor) -> Tensor:
+        if self.hparams.normalize_advantage and advantage.numel() > 1:
+            loc = advantage.mean()
+            scale = advantage.std().clamp_min(1e-6)
+            return (advantage - loc) / scale
+        return advantage
 
-    def select_action(self, state: Tensor) -> tuple[Tensor, Tensor]:
-        distribution: Distribution = self.actor(state.to(self.device))
-        action = distribution.sample()
-        log_prob = distribution.log_prob(action)
-        return action, log_prob.detach()
+    def select_action(self, state: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        state = torch.atleast_2d(torch.tensor(state).to(self.device).float())
+        distr: Distribution = self.actor(state)
+        action = distr.sample()
+        log_prob = distr.log_prob(action)
+        if isinstance(distr, torch.distributions.Categorical):
+            action = action.long()
+        else:
+            action = action.float()
+        return (
+            action.detach().cpu().numpy(),
+            log_prob.detach().cpu().float().numpy()
+        )
+    
+    def predict_value(self, state: np.ndarray) -> np.ndarray:
+        state = torch.atleast_2d(torch.tensor(state).to(self.device).float())
+        value = self.critic(state).flatten()
+        return value.detach().cpu().float().numpy()
     
     def on_before_optimizer_step(self, optimizer: Optimizer) -> None:
         # torch clip_grad_norm_ returns norm before clipping
-        if self.hparams.clip_grad_norm_actor is not None:
-            actor_grad_norm = torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.hparams.clip_grad_norm_actor)
-            actor_grad_norm_clipped = min(actor_grad_norm, self.hparams.clip_grad_norm_actor)
-        else:
-            actor_grad_norm = global_grad_norm(self.actor.parameters())
-            actor_grad_norm_clipped = actor_grad_norm
 
+        grad_norm_total = global_grad_norm(self.parameters())
+        grad_norm_actor = global_grad_norm(self.actor.parameters())
+        grad_norm_critic = global_grad_norm(self.critic.parameters())
+
+        if self.hparams.clip_grad_norm_total is not None:
+            torch.nn.utils.clip_grad_norm_(self.parameters(), self.hparams.clip_grad_norm_total)    
+        if self.hparams.clip_grad_norm_actor is not None:
+            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.hparams.clip_grad_norm_actor)
         if self.hparams.clip_grad_norm_critic is not None:
-            critic_grad_norm = torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.hparams.clip_grad_norm_critic)
-            critic_grad_norm_clipped = min(critic_grad_norm, self.hparams.clip_grad_norm_critic)
-        else:
-            critic_grad_norm = global_grad_norm(self.critic.parameters())
-            critic_grad_norm_clipped = critic_grad_norm
+            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.hparams.clip_grad_norm_critic)
+        
+        grad_norm_clipped_actor = global_grad_norm(self.actor.parameters())
+        grad_norm_clipped_critic = global_grad_norm(self.critic.parameters())
+        grad_norm_clipped_total = global_grad_norm(self.parameters())
 
         self.log_dict({
-            "actor_grads/norm_unclipped": actor_grad_norm,
-            "actor_grads/norm_clipped": actor_grad_norm_clipped,
-            "critic_grads/norm_unclipped": critic_grad_norm,
-            "critic_grads/norm_clipped": critic_grad_norm_clipped,
+            "actor_grads/norm_unclipped": grad_norm_actor,
+            "actor_grads/norm_clipped": grad_norm_clipped_actor,
+            "critic_grads/norm_unclipped": grad_norm_critic,
+            "critic_grads/norm_clipped": grad_norm_clipped_critic,
+            "total_grads/norm_unclipped": grad_norm_total,
+            "total_grads/norm_clipped": grad_norm_clipped_total,
         })
 
 
-class MonteCarloReinforce(lightning.LightningModule, Agent):
-    def __init__(self, backbone_config: dict[str, Any], action_dim: int, optim_config: dict[str, Any], return_scaler_config: dict[str, Any], normalize_returns: bool,) -> None:
-        super().__init__()
-        self.save_hyperparameters()
-        self.actor = ContinuousActor(FeedForward(**backbone_config), action_dim)
-        # if use_baseline:
-        #     self.baseline = Critic(FeedForward(**backbone_config))
-        # else:
-        #     self.baseline = None
-        if return_scaler_config is None:
-            self.return_scaler = torch.nn.Identity()
-        else:
-            self.return_scaler = Scaler(**return_scaler_config)
+class EpisodeCollector:
+    def __init__(
+        self,
+        agent: Agent,
+        gamma: float,
+        gae_lambda: float,
+        make_env: Callable[[int | None, bool], gym.Env],
+        make_env_kwargs: dict[str, Any] | list[dict[str, Any]] | None = None,
+        num_parallel_envs: int | None = None,
+        seed: int | None = None,
+    ) -> None:
+        if num_parallel_envs is None:
+            if make_env_kwargs is None:
+                raise ValueError("Either make_env_kwargs or num_parallel_envs must be set")
+            if isinstance(make_env_kwargs, dict):
+                raise ValueError("num_parallel_envs must be set if make_env_kwargs is a dict")
+        
+        if make_env_kwargs is None:
+            make_env_kwargs = {}
+        if isinstance(make_env_kwargs, dict):
+            make_env_kwargs = [make_env_kwargs for _ in range(num_parallel_envs)]
+        if num_parallel_envs is None:
+            num_parallel_envs = len(make_env_kwargs)
+        if len(make_env_kwargs) != num_parallel_envs:
+            raise ValueError("make_env_kwargs must have the same length as num_parallel_envs")
 
-    def forward(self, x: Tensor) -> Tensor:
-        return self.actor(x)
-    
-    def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.actor.parameters(), **self.hparams.optim_config)
-        return optimizer
-    
-    def training_step(self, batch: Transition, batch_idx: int) -> Tensor:
-        distribution: Distribution = self.actor(batch.state)
-        returns = self.return_scaler(batch.future_return)
-        log_prob = distribution.log_prob(batch.action)
-        if self.hparams.normalize_returns:
-            returns = (returns - returns.mean()) / returns.std()
-        actor_loss = -(log_prob * returns).mean()
-        self.log("actor_loss", actor_loss)
-        return actor_loss 
-    
-    def select_action(self, state: Tensor) -> tuple[Tensor, Tensor]:
-        distribution: Distribution = self.actor(state.to(self.device))
-        action = distribution.sample()
-        log_prob = distribution.log_prob(action)
-        return action, log_prob.detach()
-
-
-class DataCollection:
-    def __init__(self, agent: Agent, env_name: str, compute_returns: bool, gamma=None, env_options=None) -> None:
-        self.agent = agent
-        self.env_name = env_name
-        self.env_options = env_options
-        self.track_future_returns = compute_returns
         self.gamma = gamma
+        self.gae_lambda = gae_lambda
+        self.agent = agent
+        self.make_env = make_env
+        self.make_env_kwargs = make_env_kwargs
+        self.num_parallel_envs = num_parallel_envs
+        self.seed = seed
 
-    def __iter__(self) -> Iterator[Transition]:
-        env, _ = create_env(self.env_name, self.env_options)
-        state, _ = env.reset()
-        transitions: list[Transition] = []
-        state = torch.from_numpy(state).float().unsqueeze(0)
+    def __iter__(self) -> Iterator[Episode]:
+        envs = gym.vector.AsyncVectorEnv([
+            functools.partial(self.make_env, **kwargs)
+            for kwargs in self.make_env_kwargs
+        ])
+        episodes = [Episode(self.gamma, self.gae_lambda) for _ in range(self.num_parallel_envs)]
+        state, _ = envs.reset(seed=self.seed)
 
         while True:
-            with torch.no_grad():
-                action, log_prob = self.agent.select_action(state)
-            action = action.cpu().squeeze(0).numpy()
-            next_state, reward, terminated, truncated, info = env.step(action)
-            next_state = torch.from_numpy(next_state).float().unsqueeze(0)
+            action, log_prob = self.agent.select_action(state)
+            next_state, reward, terminated, truncated, infos = envs.step(action)
+            done = terminated | truncated
+            for i, episode in enumerate(episodes):
+                episode.append(s=state[i], a=action[i], r=reward[i], lp=log_prob[i])
 
-            if "episode" in info:
-                episodic_return = float(info["episode"]["r"])
-                episodic_length = int(info["episode"]["l"])
-            else:
-                episodic_return = math.nan
-                episodic_length = math.nan
-
-            transition = Transition(
-                state=state,
-                action=torch.from_numpy(action),
-                reward=float(reward),
-                next_state=next_state,
-                log_prob=log_prob.cpu(),
-                terminated=bool(terminated),
-                truncated=bool(truncated),
-                future_return=math.nan,
-                episodic_length=episodic_length,
-                episodic_return=episodic_return,
-            )
-
-            if self.track_future_returns:
-                transitions.append(transition)
-            else:
-                yield transition
+            # AsyncVectorEnv automatically resets environments when they are done
+            # so next_state might be a resetted state instead of a final state
+            # which is desired for running the agent, but we still want the true 
+            # final state for training
+            for ep in done.nonzero()[0]:
+                ep_returns = float(infos["final_info"][ep]["episode"]["r"])
+                final_state = infos["final_observation"][ep]
+                episodes[ep].finish(self.agent, final_state, ep_returns, truncated[ep])
+                yield episodes[ep]
+                episodes[ep] = Episode(self.gamma, self.gae_lambda)
 
             state = next_state
 
-            if terminated or truncated:
-                if self.track_future_returns:
-                    self._compute_future_returns(transitions)
-                    yield from transitions
-                    transitions.clear()
 
-                state, _ = env.reset()
-                state = torch.from_numpy(state).float().unsqueeze(0)
-
-    def _compute_future_returns(self, transitions: list[Transition]) -> None:
-        returns = 0.0
-        for transition in reversed(transitions):
-            returns = transition.reward + self.gamma * returns
-            transition.future_return.fill_(returns)
-
-
-class DataTracker(lightning.Callback):
+class EpisodeTracker(lightning.Callback):
     def __init__(self) -> None:
         self.finished_episodes = 0
         self.episodic_returns = []
         self.episodic_lengths = []
 
-    def __call__(self, transition: Transition) -> Any:
-        if not math.isnan(transition.episodic_return):
-            self.finished_episodes += 1
-            self.episodic_returns.append(transition.episodic_return)
-            self.episodic_lengths.append(transition.episodic_length)
-        return transition
+    def __call__(self, episode: Episode) -> Episode:
+        self.finished_episodes += 1
+        self.episodic_returns.append(episode.ep_return)
+        self.episodic_lengths.append(len(episode))
+        return episode
         
     def on_train_batch_end(self, trainer: lightning.Trainer, pl_module: lightning.LightningModule, outputs: Any, batch: Any, batch_idx: int) -> None:
         if batch_idx % trainer.log_every_n_steps == 0 and len(self.episodic_returns) > 0:
@@ -339,58 +344,88 @@ class DataTracker(lightning.Callback):
 def get_dataloader(
     agent: Agent,
     env_name: str,
-    batch_size: int,
     buffer_size: int,
-    buffer_repeat: int | None,
-    compute_returns: bool,
-    gamma: float = None,
+    batch_size: int,
+    repeat: int,
+    gamma: float,
+    gae_lambda: float,
+    num_parallel_envs: int,
     env_options = None,
-) -> tuple[torch.utils.data.DataLoader, DataTracker]:
-    data_collection = DataCollection(agent, env_name, compute_returns, gamma, env_options)
-    data_tracker = DataTracker()
+    seed: int | None = None,
+) -> tuple[torch.utils.data.DataLoader, EpisodeTracker]:
+    episode_collector = EpisodeCollector(agent, gamma, gae_lambda, env_name, env_options, num_parallel_envs, seed)
+    episode_tracker = EpisodeTracker()
     pipe: dp.iter.IterDataPipe
-    pipe = dp.iter.IterableWrapper(data_collection)
-    pipe = pipe.map(data_tracker)
-    if buffer_repeat is not None and buffer_repeat > 1:
-        pipe = pipe.repeat(buffer_repeat)
-    pipe = pipe.shuffle(buffer_size=buffer_size)
-    loader = torch.utils.data.DataLoader(
-        pipe,
-        batch_size,
-        pin_memory=True,
-        shuffle=False
-    )
-    return loader, data_tracker
+
+    pipe = dp.iter.IterableWrapper(episode_collector)
+    pipe = pipe.map(episode_tracker)
+    pipe = pipe.flatmap(Episode.to_transitions)
+    pipe = pipe.batch(buffer_size)
+    if repeat > 1:
+        pipe = pipe.repeat(repeat)
+    pipe = pipe.in_batch_shuffle()
+    pipe = pipe.unbatch()
+
+    loader = torch.utils.data.DataLoader(pipe, batch_size, pin_memory=True, shuffle=False)
+    return loader, episode_tracker
 
 
 def main(
-    env_name = 'pendulum',
-    batch_size: int = 256,
-    buffer_size: int = 1024,
+    env_name = 'cartpole',
+    buffer_size: int = 2048*8, # TODO
     buffer_repeat: int = 10,
+    batch_size: int = 64,
+    num_parallel_envs: int = 8,
     device: str = "cuda",
-    backbone_config = None,
+    hidden_dim: int = 64,
+    hidden_layers: int = 2,
+    clip_grad_norm_actor: float = None,
+    clip_grad_norm_critic: float = None,
+    clip_grad_norm_total: float = 0.5,
+    entropy_limit_steps: int = -1,
+    entropy_coeff: float = 0.00,
+    critic_coeff: float = 1.0,
+    epsilon: float = 0.2,
+    limit_steps: int = -1,
+    critic_loss_fn: str = "smooth_l1_loss",
+    lr_actor: float = 2.5e-4,
+    lr_critic: float = 2.5e-4,
+    gamma: float = 0.99,
+    gae_lambda: float = 0.5,
+    normalize_advantage: bool = True,
+    seed: int = 0,
 ) -> None:
-    if backbone_config is None:
-        backbone_config = dict(
-            hidden_dim=64,
-            num_blocks=1,
-            use_skips=False,
-        )
+    
+    args = locals().copy()
+
+    if device == "cuda":
+        import torch.backends.cudnn
+        torch.backends.cudnn.deterministic = True
+    
+    lightning.seed_everything(seed)
 
     env, name = create_env(env_name)
-    input_dim = np.prod(env.observation_space.shape)
-    action_dim = np.prod(env.action_space.shape)
-    backbone_config["input_dim"] = input_dim
+    input_dim = int(np.prod(env.observation_space.shape))
+    if isinstance(env.action_space, gym.spaces.Discrete):
+        action_dim = env.action_space.n
+    else:
+        action_dim = int(np.prod(env.action_space.shape))
+    architecture_dims = [input_dim] + [hidden_dim] * hidden_layers + [action_dim]
 
     algo = PPO(
-        backbone_config,
-        action_dim,
-        normalize_advantage=False,
-        epsilon=0.2,
-        clip_grad_norm_actor=0.5,
-        clip_grad_norm_critic=0.5,
-        backbone_is_shared=False,
+        architecture_dims,
+        epsilon=epsilon,
+        critic_coeff=critic_coeff,
+        entropy_coeff=entropy_coeff,
+        gamma=gamma,
+        normalize_advantage=normalize_advantage,
+        clip_grad_norm_actor=clip_grad_norm_actor,
+        clip_grad_norm_critic=clip_grad_norm_critic,
+        clip_grad_norm_total=clip_grad_norm_total,
+        entropy_limit_steps=entropy_limit_steps,
+        critic_loss_fn=critic_loss_fn,
+        lr_actor=lr_actor,
+        lr_critic=lr_critic,
     )
 
     wandb_logger = lightning.pytorch.loggers.WandbLogger(
@@ -399,20 +434,21 @@ def main(
         save_dir="./wandb",
         tags=[env_name, algo.__class__.__name__]
     )
-    wandb_logger.experiment.config.update({
-        "algo": algo.__class__.__name__,
-        "replay_buffer_size": buffer_size,
-        "batch_size": batch_size,
-    })
+    wandb_logger.experiment.config.update({"args": args})
+
+    def make_env(**kwargs):
+        return create_env(env_name, limit_steps, options=kwargs)[0]
 
     loader, tracker = get_dataloader(
         algo,
-        env_name,
-        batch_size,
+        make_env,
         buffer_size,
+        batch_size,
         buffer_repeat,
-        compute_returns=False,
-        gamma=0.99,
+        gamma,
+        gae_lambda,
+        num_parallel_envs,
+        seed=seed,
     )
 
     trainer = lightning.Trainer(
@@ -421,8 +457,6 @@ def main(
         precision="16-mixed",
         logger=wandb_logger,
         callbacks=[tracker],
-        gradient_clip_algorithm="norm",
-        gradient_clip_val=0.5,
     )
     trainer.fit(algo, loader)
     

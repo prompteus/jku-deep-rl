@@ -27,16 +27,30 @@ class FeedForward(torch.nn.Module):
         return self.nn(x)
 
 
+def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
+    torch.nn.init.orthogonal_(layer.weight, std)
+    torch.nn.init.constant_(layer.bias, bias_const)
+    return layer
+
+
+# TODO don't ignore dims
 class DiscreteActor(torch.nn.Module):
     def __init__(self, dims: list[int]) -> None:
         super().__init__()
-        self.nn = FeedForward(dims)
+        #self.nn = FeedForward(dims)
+        self.actor = torch.nn.Sequential(
+            layer_init(torch.nn.Linear(dims[0], 64)),
+            torch.nn.Tanh(),
+            layer_init(torch.nn.Linear(64, 64)),
+            torch.nn.Tanh(),
+            layer_init(torch.nn.Linear(64, dims[-1]), std=0.01),
+        )
 
-    def init_weights(self) -> None:
-        torch.nn.init.orthogonal_(self.nn.nn[-1].weight, 0.01)
+    #def init_weights(self) -> None:
+    #    torch.nn.init.orthogonal_(self.nn.nn[-1].weight, 0.01)
 
     def forward(self, x: torch.Tensor) -> torch.distributions.Distribution:
-        logits = self.nn(x)
+        logits = self.actor(x)
         return torch.distributions.Categorical(logits=logits)
 
 
@@ -63,17 +77,26 @@ class ContinuousActor(torch.nn.Module):
         return distribution
 
 
+# TODO don't ignore dims
 class Critic(torch.nn.Module):
     def __init__(self, dims: list[int]) -> None:
         super().__init__()
-        self.nn = FeedForward(dims)
-        self.init_weights()
+        #self.nn = FeedForward(dims)
+        #self.init_weights()
+        self.critic = torch.nn.Sequential(
+            layer_init(torch.nn.Linear(dims[0], 64)),
+            torch.nn.Tanh(),
+            layer_init(torch.nn.Linear(64, 64)),
+            torch.nn.Tanh(),
+            layer_init(torch.nn.Linear(64, 1), std=1.0),
+        )
 
-    def init_weights(self) -> None:
-        torch.nn.init.orthogonal_(self.nn.nn[-1].weight, 1.0)
+    #def init_weights(self) -> None:
+        #torch.nn.init.orthogonal_(self.nn.nn[-1].weight, 1.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.nn(x)
+        return self.critic(x)
+        #return self.nn(x)
 
 
 class Agent(abc.ABC):
