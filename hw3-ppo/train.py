@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import functools
 from typing import Any, NamedTuple, Iterator, Iterable, Callable
 
@@ -14,6 +13,7 @@ import lightning.pytorch.callbacks
 import typer
 import torchdata.datapipes as dp
 import torchviz
+import wandb
 from torch import Tensor
 from torch.optim.optimizer import Optimizer
 from torch.distributions import Distribution
@@ -31,63 +31,91 @@ class Transition(NamedTuple):
     log_prob: Tensor
     gae_advantage: Tensor
     gae_return: Tensor
+    ep_length: Tensor
+    ep_return: Tensor
 
 
-class Episode:
+class Buffer:
     def __init__(self, gamma: float, gae_lambda: float) -> None:
         self.gamma = gamma
         self.gae_lambda = gae_lambda
         self.states = []
-        self.values = None
         self.actions = []
         self.rewards = []
         self.log_probs = []
-        self.ep_return = None
-        self.gae_advantages = []
-        self.truncated = None
+        self.truncateds = []
+        self.terminateds = []
+        self.values = []
+        self.ep_lengths = []
+        self.ep_returns = []
+        self.gae_advantages = None
+        self.gae_returns = None
 
-    def append(self, s, a, r, lp) -> None:
-        self.states.append(s)
-        self.actions.append(a)
-        self.rewards.append(r)
-        self.log_probs.append(lp)
+    def append(self, s, a, r, lp, v, ter, trun, ep_l, ep_r) -> None:
+        self.states.append(torch.tensor(s))
+        self.actions.append(torch.tensor(a))
+        self.rewards.append(torch.tensor(r))
+        self.log_probs.append(torch.tensor(lp))
+        self.values.append(torch.tensor(v))
+        self.terminateds.append(torch.tensor(ter))
+        self.truncateds.append(torch.tensor(trun))
+        self.ep_lengths.append(torch.tensor(ep_l))
+        self.ep_returns.append(torch.tensor(ep_r))
 
-    def finish(self, agent: Agent, final_state, ep_return: float, truncated: bool) -> None:
-        self.states.append(final_state)
-        self.values = agent.predict_value(np.array(self.states))
-        if not truncated:
-            self.values[-1] = 0.0
-        self.ep_return = ep_return
-        self.truncated = truncated
+    def flush(self) -> Iterator[Transition]:
+        self.states = torch.stack(self.states)
+        self.actions = torch.stack(self.actions)
+        self.rewards = torch.stack(self.rewards)
+        self.log_probs = torch.stack(self.log_probs)
+        self.values = torch.stack(self.values)
+        self.terminateds = torch.stack(self.terminateds)
+        self.truncateds = torch.stack(self.truncateds)
+        self.ep_lengths = torch.stack(self.ep_lengths)
+        self.ep_returns = torch.stack(self.ep_returns)
+
         self._compute_gae_advantages()
 
-    def _compute_gae_advantages(self) -> None:
-        rewards = np.array(self.rewards)
-        values = np.array(self.values)
-        td_targets = rewards + self.gamma * values[1:]
-        td_advantages = td_targets - values[:-1]
-        gae_advantages = [0.0] * len(values)
-        for t in reversed(range(len(gae_advantages) - 1)):
-            gae_advantages[t] = td_advantages[t] + self.gamma * self.gae_lambda * gae_advantages[t + 1]
-        self.gae_advantages = gae_advantages[:-1]
-
-    def __len__(self) -> int:
-        return len(self.actions)
-    
-    def to_transitions(self) -> Iterator[Transition]:
-        if self.ep_return is None:
-            raise ValueError("Episode not finished")
+        for t in range(len(self.actions)):
+            batch = zip(self.states[t], self.values[t], self.actions[t], self.rewards[t], self.log_probs[t], self.gae_advantages[t], self.gae_returns[t], self.ep_lengths[t], self.ep_returns[t])
+            for s, v, a, r, lp, gae_adv, gae_ret, ep_l, ep_r in batch:
+                yield Transition(
+                    state=s,
+                    value=v,
+                    action=a,
+                    reward=r,
+                    log_prob=lp,
+                    gae_advantage=gae_adv,
+                    gae_return=gae_ret,
+                    ep_length=ep_l,
+                    ep_return=ep_r,
+                )
         
-        for i in range(len(self)):
-            yield Transition(
-                state=self.states[i],
-                value=self.values[i],
-                action=self.actions[i],
-                reward=self.rewards[i],
-                log_prob=self.log_probs[i],
-                gae_advantage=self.gae_advantages[i],
-                gae_return=self.gae_advantages[i] + self.values[i],
-            )
+        self.states = []
+        self.actions = []
+        self.rewards = []
+        self.log_probs = []
+        self.values = []
+        self.terminateds = []
+        self.truncateds = []
+        self.ep_lengths = []
+        self.ep_returns = []
+        self.gae_advantages = None
+        self.gae_returns = None
+
+    def finish_batch(self, next_state, next_value, ) -> Iterator[Transition]:
+        self.states.append(torch.tensor(next_state))
+        self.values.append(torch.tensor(next_value))
+
+    def _compute_gae_advantages(self) -> None:
+        dones = self.terminateds | self.truncateds
+        td_targets = self.rewards + self.gamma * (~dones) * self.values[1:]
+        td_advantage = td_targets - self.values[:-1]
+        gae_advantages = torch.zeros_like(self.values)
+        for t in reversed(range(len(gae_advantages) - 1)):
+            gae_advantages[t] = td_advantage[t] + self.gamma * self.gae_lambda * (~dones[t]) * gae_advantages[t+1]
+        self.gae_advantages = gae_advantages[:-1]
+        self.gae_returns = self.gae_advantages + self.values[:-1]
+        ...
 
 
 @torch.no_grad()
@@ -99,9 +127,9 @@ class PPO(lightning.LightningModule, Agent):
     def __init__(
         self,
         architecture_dims: list[int],
-        epsilon,
-        entropy_coeff: float,
-        critic_coeff: float,
+        clip_coef: float,
+        entropy_loss_coef: float,
+        critic_td_loss_coef: float,
         gamma: float,
         critic_loss_fn: str,
         lr_actor: float,
@@ -123,7 +151,7 @@ class PPO(lightning.LightningModule, Agent):
         self.critic = Critic(architecture_dims[:-1] + [1])
         self.critic_loss_fn = getattr(torch.nn.functional, critic_loss_fn)
         self.log_ratio_bounds: torch.Tensor
-        self.register_buffer("log_ratio_bounds", torch.log1p(torch.tensor([-epsilon, epsilon])))
+        self.register_buffer("log_ratio_bounds", torch.log1p(torch.tensor([-clip_coef, clip_coef])))
         if clip_grad_norm_total is not None and (clip_grad_norm_critic is not None or clip_grad_norm_actor is not None):
             raise ValueError("Cannot specify both clip_grad_norm_total and clip_grad_norm_critic/actor")
 
@@ -138,26 +166,30 @@ class PPO(lightning.LightningModule, Agent):
         ])
         return optimizer
     
-    def _entropy_coeff(self) -> float:
+    def _entropy_loss_coef(self) -> float:
         if self.hparams.entropy_limit_steps == -1:
-            return self.hparams.entropy_coeff
+            return self.hparams.entropy_loss_coef
         if self.global_step >= self.hparams.entropy_limit_steps:
             return 0.0
-        return self.hparams.entropy_coeff
+        return self.hparams.entropy_loss_coef
 
-    def critic_loss(self, batch: Transition) -> tuple[Tensor, Tensor]:
+    def critic_loss(self, batch: Transition) -> Tensor:
         curr_value = self.critic(batch.state).flatten()
         critic_td_loss = self.critic_loss_fn(curr_value, batch.gae_return)
-        critic_td_loss *= self.hparams.critic_coeff
+        critic_td_loss *= self.hparams.critic_td_loss_coef
+        self.log_dict({
+            "loss/critic_td_loss": critic_td_loss,
+            "loss/critic_ld_loss_coef": self.hparams.critic_td_loss_coef,
+        })
         return critic_td_loss
 
     def actor_loss(self, batch: Transition) -> tuple[Tensor, Tensor]:
         distr: Distribution = self.actor(batch.state)
         log_prob = distr.log_prob(batch.action)
         ratio = (log_prob - batch.log_prob).exp()
-        ratio_clipped = ratio.clamp(1-self.hparams.epsilon, 1+self.hparams.epsilon)
-        #assert (ratio_clipped >= 1 - self.hparams.epsilon - 0.0001).all()
-        #assert (ratio_clipped <= 1 + self.hparams.epsilon + 0.0001).all()
+        ratio_clipped = ratio.clamp(1-self.hparams.clip_coef, 1+self.hparams.clip_coef)
+        #assert (ratio_clipped >= 1 - self.hparams.clip_coef - 0.0001).all()
+        #assert (ratio_clipped <= 1 + self.hparams.clip_coef + 0.0001).all()
         advantage = self._normalize_advantage(batch.gae_advantage)
         surr_1 = advantage * ratio
         surr_2 = advantage * ratio_clipped
@@ -165,35 +197,32 @@ class PPO(lightning.LightningModule, Agent):
         actor_ppo_loss = -surr.mean()
         entropy = distr.entropy().mean(dim=0)
         self.log_dict({
+            "loss/actor_ppo_loss": actor_ppo_loss,
             "importance_ratio_min": ratio.min(),
             "importance_ratio_max": ratio.max(),
             "ratio_outside_bounds": 1 - torch.isclose(ratio, ratio_clipped).float().mean(),
-            "clipped_fraction": torch.isclose(surr, surr_2).float().mean()
+            "clipped_fraction": torch.isclose(surr, surr_2).float().mean(),
+            "advantage": advantage.mean(),
         })
         return actor_ppo_loss, entropy
 
     def entropy_loss(self, entropy: Tensor) -> Tensor:
-        entropy_coeff = self._entropy_coeff()
+        entropy_loss_coef = self._entropy_loss_coef()
         entropy_loss = -entropy
-        entropy_loss *= entropy_coeff
-        return entropy_loss, entropy_coeff
+        entropy_loss *= entropy_loss_coef
+        self.log_dict({
+            "actor_entropy": entropy,
+            "loss/actor_entropy_loss": entropy_loss,
+            "loss/actor_entropy_loss_coef": entropy_loss_coef,
+        })
+        return entropy_loss
 
     def training_step(self, batch: Transition, batch_idx: int) -> Tensor:
         critic_td_loss = self.critic_loss(batch)
         actor_ppo_loss, entropy = self.actor_loss(batch)
-        entropy_loss, entropy_coeff = self.entropy_loss(entropy)
+        entropy_loss = self.entropy_loss(entropy)
         loss = actor_ppo_loss + critic_td_loss + entropy_loss
-        self.log_dict({
-            "actor_ppo_loss": actor_ppo_loss,
-            "critic_td_loss": critic_td_loss,
-            "actor_entropy_loss": entropy_loss,
-            "actor_entropy_coeff": entropy_coeff,
-            "actor_entropy": entropy,
-            "critic_loss_coeff": self.hparams.critic_coeff,
-            "gae_advantage": batch.gae_advantage.mean(),
-            "total_loss": loss,
-        })
-        
+        self.log("loss/total_loss", loss)
         # Check if losses don't send gradients to the wrong network:
         # torchviz.make_dot(loss, params=dict(self.named_parameters()))
         # torch.autograd.grad(actor_ppo_loss, self.critic.parameters(), allow_unused=True)
@@ -246,21 +275,22 @@ class PPO(lightning.LightningModule, Agent):
         grad_norm_clipped_total = global_grad_norm(self.parameters())
 
         self.log_dict({
-            "actor_grads/norm_unclipped": grad_norm_actor,
-            "actor_grads/norm_clipped": grad_norm_clipped_actor,
-            "critic_grads/norm_unclipped": grad_norm_critic,
-            "critic_grads/norm_clipped": grad_norm_clipped_critic,
-            "total_grads/norm_unclipped": grad_norm_total,
-            "total_grads/norm_clipped": grad_norm_clipped_total,
+            "grad_norm/actor_unclipped": grad_norm_actor,
+            "grad_norm/actor_clipped": grad_norm_clipped_actor,
+            "grad_norm/critic_unclipped": grad_norm_critic,
+            "grad_norm/critic_clipped": grad_norm_clipped_critic,
+            "grad_norm/total_unclipped": grad_norm_total,
+            "grad_norm/total_clipped": grad_norm_clipped_total,
         })
 
 
-class EpisodeCollector:
+class DataCollector:
     def __init__(
         self,
         agent: Agent,
         gamma: float,
         gae_lambda: float,
+        buffer_size: int,
         make_env: Callable[[int | None, bool], gym.Env],
         make_env_kwargs: dict[str, Any] | list[dict[str, Any]] | None = None,
         num_parallel_envs: int | None = None,
@@ -284,61 +314,49 @@ class EpisodeCollector:
         self.gamma = gamma
         self.gae_lambda = gae_lambda
         self.agent = agent
+        self.buffer_size = buffer_size
         self.make_env = make_env
         self.make_env_kwargs = make_env_kwargs
         self.num_parallel_envs = num_parallel_envs
         self.seed = seed
 
-    def __iter__(self) -> Iterator[Episode]:
+    def __iter__(self) -> Iterator[Transition]:
         envs = gym.vector.AsyncVectorEnv([
             functools.partial(self.make_env, **kwargs)
             for kwargs in self.make_env_kwargs
         ])
-        episodes = [Episode(self.gamma, self.gae_lambda) for _ in range(self.num_parallel_envs)]
-        state, _ = envs.reset(seed=self.seed)
+
+        buffer = Buffer(self.gamma, self.gae_lambda)
+        state, _ = envs.reset()
+        num_finished_episodes = 0
+        total_env_steps = 0
 
         while True:
-            action, log_prob = self.agent.select_action(state)
-            next_state, reward, terminated, truncated, infos = envs.step(action)
-            done = terminated | truncated
-            for i, episode in enumerate(episodes):
-                episode.append(s=state[i], a=action[i], r=reward[i], lp=log_prob[i])
+            for _ in range(self.buffer_size // self.num_parallel_envs):
+                action, log_prob = self.agent.select_action(state)
+                next_state, reward, terminated, truncated, infos = envs.step(action)
+                value = self.agent.predict_value(next_state)
+                ep_returns = np.full(self.num_parallel_envs, np.nan)
+                ep_lengths = np.full(self.num_parallel_envs, np.nan)
+                if "final_info" in infos:
+                    for ep, info in enumerate(infos["final_info"]):
+                        if info is not None:
+                            num_finished_episodes += 1
+                            wandb.log({
+                                "collect_experience/episodic_return": float(info["episode"]["r"]),
+                                "collect_experience/episodic_length": int(info["episode"]["l"]),
+                                "collect_experience/finished_episodes": num_finished_episodes,
+                                "collect_experience/total_env_steps": total_env_steps,
+                            })
+                            ep_returns[ep] = info["episode"]["r"]
+                            ep_lengths[ep] = info["episode"]["l"]
 
-            # AsyncVectorEnv automatically resets environments when they are done
-            # so next_state might be a resetted state instead of a final state
-            # which is desired for running the agent, but we still want the true 
-            # final state for training
-            for ep in done.nonzero()[0]:
-                ep_returns = float(infos["final_info"][ep]["episode"]["r"])
-                final_state = infos["final_observation"][ep]
-                episodes[ep].finish(self.agent, final_state, ep_returns, truncated[ep])
-                yield episodes[ep]
-                episodes[ep] = Episode(self.gamma, self.gae_lambda)
+                total_env_steps += self.num_parallel_envs
+                buffer.append(s=state, a=action, r=reward, lp=log_prob, ter=terminated, trun=truncated, v=value, ep_l=ep_lengths, ep_r=ep_returns)
+                state = next_state
 
-            state = next_state
-
-
-class EpisodeTracker(lightning.Callback):
-    def __init__(self) -> None:
-        self.finished_episodes = 0
-        self.episodic_returns = []
-        self.episodic_lengths = []
-
-    def __call__(self, episode: Episode) -> Episode:
-        self.finished_episodes += 1
-        self.episodic_returns.append(episode.ep_return)
-        self.episodic_lengths.append(len(episode))
-        return episode
-        
-    def on_train_batch_end(self, trainer: lightning.Trainer, pl_module: lightning.LightningModule, outputs: Any, batch: Any, batch_idx: int) -> None:
-        if batch_idx % trainer.log_every_n_steps == 0 and len(self.episodic_returns) > 0:
-            pl_module.log_dict({
-                "collect_experience/episodic_return": np.mean(self.episodic_returns),
-                "collect_experience/episodic_length": np.mean(self.episodic_lengths),
-                "collect_experience/num_finished_episodes_so_far": float(self.finished_episodes),
-            })
-            self.episodic_returns.clear()
-            self.episodic_lengths.clear()
+            buffer.finish_batch(next_state, self.agent.predict_value(next_state))
+            yield from buffer.flush()
 
 
 def get_dataloader(
@@ -352,14 +370,11 @@ def get_dataloader(
     num_parallel_envs: int,
     env_options = None,
     seed: int | None = None,
-) -> tuple[torch.utils.data.DataLoader, EpisodeTracker]:
-    episode_collector = EpisodeCollector(agent, gamma, gae_lambda, env_name, env_options, num_parallel_envs, seed)
-    episode_tracker = EpisodeTracker()
+) -> torch.utils.data.DataLoader:
+    data_collector = DataCollector(agent, gamma, gae_lambda, buffer_size, env_name, env_options, num_parallel_envs, seed)
     pipe: dp.iter.IterDataPipe
 
-    pipe = dp.iter.IterableWrapper(episode_collector)
-    pipe = pipe.map(episode_tracker)
-    pipe = pipe.flatmap(Episode.to_transitions)
+    pipe = dp.iter.IterableWrapper(data_collector)
     pipe = pipe.batch(buffer_size)
     if repeat > 1:
         pipe = pipe.repeat(repeat)
@@ -367,12 +382,12 @@ def get_dataloader(
     pipe = pipe.unbatch()
 
     loader = torch.utils.data.DataLoader(pipe, batch_size, pin_memory=True, shuffle=False)
-    return loader, episode_tracker
+    return loader
 
 
 def main(
-    env_name = 'cartpole',
-    buffer_size: int = 2048*8, # TODO
+    env_name = 'CartPole-v1',
+    buffer_size: int = 2048, # TODO
     buffer_repeat: int = 10,
     batch_size: int = 64,
     num_parallel_envs: int = 8,
@@ -383,16 +398,16 @@ def main(
     clip_grad_norm_critic: float = None,
     clip_grad_norm_total: float = 0.5,
     entropy_limit_steps: int = -1,
-    entropy_coeff: float = 0.00,
-    critic_coeff: float = 1.0,
-    epsilon: float = 0.2,
+    entropy_loss_coef: float = 0.00,
+    critic_td_loss_coef: float = 1.0,
+    clip_coef: float = 0.2,
     limit_steps: int = -1,
     critic_loss_fn: str = "smooth_l1_loss",
-    lr_actor: float = 2.5e-4,
-    lr_critic: float = 2.5e-4,
+    lr_actor: float = 1e-4,
+    lr_critic: float = 1e-4,
     gamma: float = 0.99,
-    gae_lambda: float = 0.5,
-    normalize_advantage: bool = True,
+    gae_lambda: float = 0.0,
+    normalize_advantage: bool = False,
     seed: int = 0,
 ) -> None:
     
@@ -404,7 +419,7 @@ def main(
     
     lightning.seed_everything(seed)
 
-    env, name = create_env(env_name)
+    env = create_env(env_name)
     input_dim = int(np.prod(env.observation_space.shape))
     if isinstance(env.action_space, gym.spaces.Discrete):
         action_dim = env.action_space.n
@@ -414,9 +429,9 @@ def main(
 
     algo = PPO(
         architecture_dims,
-        epsilon=epsilon,
-        critic_coeff=critic_coeff,
-        entropy_coeff=entropy_coeff,
+        clip_coef=clip_coef,
+        critic_td_loss_coef=critic_td_loss_coef,
+        entropy_loss_coef=entropy_loss_coef,
         gamma=gamma,
         normalize_advantage=normalize_advantage,
         clip_grad_norm_actor=clip_grad_norm_actor,
@@ -430,16 +445,16 @@ def main(
 
     wandb_logger = lightning.pytorch.loggers.WandbLogger(
         project="jku-deep-rl_ppo",
-        group=name,
+        group=env_name,
         save_dir="./wandb",
         tags=[env_name, algo.__class__.__name__]
     )
     wandb_logger.experiment.config.update({"args": args})
 
     def make_env(**kwargs):
-        return create_env(env_name, limit_steps, options=kwargs)[0]
+        return create_env(env_name, limit_steps, options=kwargs)
 
-    loader, tracker = get_dataloader(
+    loader = get_dataloader(
         algo,
         make_env,
         buffer_size,
@@ -456,11 +471,10 @@ def main(
         max_epochs=-1,
         precision="16-mixed",
         logger=wandb_logger,
-        callbacks=[tracker],
     )
+
     trainer.fit(algo, loader)
     
 
-
 if __name__ == "__main__":
-    typer.run(main)    
+    typer.run(main)
