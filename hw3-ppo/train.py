@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import math
 import functools
-from typing import Any, NamedTuple, Iterator, Iterable, Callable
+from typing import Any, NamedTuple, Iterator, Iterable, Callable, Optional
 
 import torch
 import torch.utils.data
@@ -12,7 +13,6 @@ import lightning.pytorch.loggers
 import lightning.pytorch.callbacks
 import typer
 import torchdata.datapipes as dp
-import torchviz
 import wandb
 from torch import Tensor
 from torch.optim.optimizer import Optimizer
@@ -20,7 +20,7 @@ from torch.distributions import Distribution
 from lovely_tensors import lovely
 
 from envs import create_env
-from models import Critic, ContinuousActor, DiscreteActor, Agent
+from models import Critic, DiscreteActor, Agent
 
 
 class Transition(NamedTuple):
@@ -134,15 +134,13 @@ class PPO(lightning.LightningModule, Agent):
         critic_loss_fn: str,
         lr_actor: float,
         lr_critic: float,
-        #use_new_value_estimate: bool,
+        normalize_advantage: bool,
         optimizer_config_actor: dict[str, Any] = dict(eps=1e-5),
         optimizer_config_critic: dict[str, Any] = dict(eps=1e-5),
         optimizer_class: str = "Adam",
-        normalize_advantage: bool = False,
         entropy_limit_steps: int = -1,
-        clip_grad_norm_actor: float = None,
-        clip_grad_norm_critic: float = None,
-        clip_grad_norm_total: float = None,
+        clip_grad_norm_actor: float = math.inf,
+        clip_grad_norm_critic: float = math.inf,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -150,10 +148,6 @@ class PPO(lightning.LightningModule, Agent):
         self.actor = DiscreteActor(architecture_dims)
         self.critic = Critic(architecture_dims[:-1] + [1])
         self.critic_loss_fn = getattr(torch.nn.functional, critic_loss_fn)
-        self.log_ratio_bounds: torch.Tensor
-        self.register_buffer("log_ratio_bounds", torch.log1p(torch.tensor([-clip_coef, clip_coef])))
-        if clip_grad_norm_total is not None and (clip_grad_norm_critic is not None or clip_grad_norm_actor is not None):
-            raise ValueError("Cannot specify both clip_grad_norm_total and clip_grad_norm_critic/actor")
 
     def forward(self, x: Tensor) -> Tensor:
         return self.actor(x)
@@ -188,8 +182,6 @@ class PPO(lightning.LightningModule, Agent):
         log_prob = distr.log_prob(batch.action)
         ratio = (log_prob - batch.log_prob).exp()
         ratio_clipped = ratio.clamp(1-self.hparams.clip_coef, 1+self.hparams.clip_coef)
-        #assert (ratio_clipped >= 1 - self.hparams.clip_coef - 0.0001).all()
-        #assert (ratio_clipped <= 1 + self.hparams.clip_coef + 0.0001).all()
         advantage = self._normalize_advantage(batch.gae_advantage)
         surr_1 = advantage * ratio
         surr_2 = advantage * ratio_clipped
@@ -223,11 +215,6 @@ class PPO(lightning.LightningModule, Agent):
         entropy_loss = self.entropy_loss(entropy)
         loss = actor_ppo_loss + critic_td_loss + entropy_loss
         self.log("loss/total_loss", loss)
-        # Check if losses don't send gradients to the wrong network:
-        # torchviz.make_dot(loss, params=dict(self.named_parameters()))
-        # torch.autograd.grad(actor_ppo_loss, self.critic.parameters(), allow_unused=True)
-        # torch.autograd.grad(entropy_loss, self.critic.parameters(), allow_unused=True)
-        # torch.autograd.grad(critic_td_loss, self.actor.parameters(), allow_unused=True)
         return loss
 
     def _normalize_advantage(self, advantage: Tensor) -> Tensor:
@@ -257,30 +244,17 @@ class PPO(lightning.LightningModule, Agent):
         return value.detach().cpu().float().numpy()
     
     def on_before_optimizer_step(self, optimizer: Optimizer) -> None:
-        # torch clip_grad_norm_ returns norm before clipping
+        actor_grad_norm = torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.hparams.clip_grad_norm_actor)
+        actor_grad_norm_clipped = min(actor_grad_norm, self.hparams.clip_grad_norm_actor)
 
-        grad_norm_total = global_grad_norm(self.parameters())
-        grad_norm_actor = global_grad_norm(self.actor.parameters())
-        grad_norm_critic = global_grad_norm(self.critic.parameters())
-
-        if self.hparams.clip_grad_norm_total is not None:
-            torch.nn.utils.clip_grad_norm_(self.parameters(), self.hparams.clip_grad_norm_total)    
-        if self.hparams.clip_grad_norm_actor is not None:
-            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.hparams.clip_grad_norm_actor)
-        if self.hparams.clip_grad_norm_critic is not None:
-            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.hparams.clip_grad_norm_critic)
-        
-        grad_norm_clipped_actor = global_grad_norm(self.actor.parameters())
-        grad_norm_clipped_critic = global_grad_norm(self.critic.parameters())
-        grad_norm_clipped_total = global_grad_norm(self.parameters())
+        critic_grad_norm = torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.hparams.clip_grad_norm_critic)
+        critic_grad_norm_clipped = min(critic_grad_norm, self.hparams.clip_grad_norm_critic)
 
         self.log_dict({
-            "grad_norm/actor_unclipped": grad_norm_actor,
-            "grad_norm/actor_clipped": grad_norm_clipped_actor,
-            "grad_norm/critic_unclipped": grad_norm_critic,
-            "grad_norm/critic_clipped": grad_norm_clipped_critic,
-            "grad_norm/total_unclipped": grad_norm_total,
-            "grad_norm/total_clipped": grad_norm_clipped_total,
+            "grad_norm/actor_unclipped": actor_grad_norm,
+            "grad_norm/actor_clipped": actor_grad_norm_clipped,
+            "grad_norm/critic_unclipped": critic_grad_norm,
+            "grad_norm/critic_clipped": critic_grad_norm_clipped,
         })
 
 
@@ -374,7 +348,11 @@ def get_dataloader(
     data_collector = DataCollector(agent, gamma, gae_lambda, buffer_size, env_name, env_options, num_parallel_envs, seed)
     pipe: dp.iter.IterDataPipe
 
-    pipe = dp.iter.IterableWrapper(data_collector)
+    # CRITICAL to have deepcopy=False,
+    # otherwise data_collector will be copied and it's agent will be copied too,
+    # causing that the agent for collecting data is a different instance than the
+    # one that is updated during training
+    pipe = dp.iter.IterableWrapper(data_collector, deepcopy=False)
     pipe = pipe.batch(buffer_size)
     if repeat > 1:
         pipe = pipe.repeat(repeat)
@@ -387,29 +365,34 @@ def get_dataloader(
 
 def main(
     env_name = 'CartPole-v1',
-    buffer_size: int = 2048, # TODO
+    buffer_size: int = 1024,
     buffer_repeat: int = 10,
     batch_size: int = 64,
     num_parallel_envs: int = 8,
     device: str = "cuda",
     hidden_dim: int = 64,
     hidden_layers: int = 2,
-    clip_grad_norm_actor: float = None,
-    clip_grad_norm_critic: float = None,
-    clip_grad_norm_total: float = 0.5,
+    clip_grad_norm_actor: float = math.inf,
+    clip_grad_norm_critic: float = math.inf,
     entropy_limit_steps: int = -1,
-    entropy_loss_coef: float = 0.00,
+    entropy_loss_coef: float = 0.01,
     critic_td_loss_coef: float = 1.0,
     clip_coef: float = 0.2,
-    limit_steps: int = -1,
+    limit_env_steps: int = -1,
     critic_loss_fn: str = "smooth_l1_loss",
     lr_actor: float = 1e-4,
     lr_critic: float = 1e-4,
     gamma: float = 0.99,
-    gae_lambda: float = 0.0,
+    gae_lambda: float = 0.95,
     normalize_advantage: bool = False,
+    wandb_project_name: str = "jku-deep-rl_ppo",
+    wandb_entity: Optional[str] = None,
+    wandb_group: Optional[str] = None,
+    wandb_save_code: bool = True,
     seed: int = 0,
 ) -> None:
+    if wandb_group is None:
+        wandb_group = env_name
     
     args = locals().copy()
 
@@ -436,7 +419,6 @@ def main(
         normalize_advantage=normalize_advantage,
         clip_grad_norm_actor=clip_grad_norm_actor,
         clip_grad_norm_critic=clip_grad_norm_critic,
-        clip_grad_norm_total=clip_grad_norm_total,
         entropy_limit_steps=entropy_limit_steps,
         critic_loss_fn=critic_loss_fn,
         lr_actor=lr_actor,
@@ -444,15 +426,17 @@ def main(
     )
 
     wandb_logger = lightning.pytorch.loggers.WandbLogger(
-        project="jku-deep-rl_ppo",
-        group=env_name,
+        project=wandb_project_name,
+        save_code=wandb_save_code,
+        entity=wandb_entity,
+        group=wandb_group,
         save_dir="./wandb",
-        tags=[env_name, algo.__class__.__name__]
+        tags=[env_name, algo.__class__.__name__],
     )
     wandb_logger.experiment.config.update({"args": args})
 
     def make_env(**kwargs):
-        return create_env(env_name, limit_steps, options=kwargs)
+        return create_env(env_name, limit_env_steps, options=kwargs)
 
     loader = get_dataloader(
         algo,
