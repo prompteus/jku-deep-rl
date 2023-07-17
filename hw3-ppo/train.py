@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import math
+import time
+import random
+import pathlib
 import functools
 import collections
-from typing import Any, NamedTuple, Iterator, Iterable, Optional, Tuple, TypedDict
+from typing import Any, NamedTuple, Iterator, Iterable, Optional, Tuple
 
 import torch
 import torch.utils.data
@@ -15,12 +18,13 @@ import lightning.pytorch.callbacks
 import typer
 import torchdata.datapipes as dp
 import wandb
+from tqdm import tqdm
 from torch import Tensor
 from torch.optim.optimizer import Optimizer
 from torch.distributions import Distribution
 from lovely_tensors import lovely
 
-from envs import create_env
+from envs import make_env
 from models import Critic, DiscreteActor, ContinuousActor, Agent
 
 
@@ -81,6 +85,59 @@ class Buffer:
         return gae_advantage, gae_return
 
 
+def measure_scores_parallel(
+    agent: Agent,
+    make_env_kwargs: list[dict[str, Any]],
+    video_folder: pathlib.Path | str | None = None,
+) -> Iterable[float]:
+    """
+    Measure scores of multiple environments in parallel.
+    """
+    if video_folder is not None:
+        video_folder = pathlib.Path(video_folder)
+        video_folder.mkdir(parents=True, exist_ok=True)
+    num_episodes = len(make_env_kwargs)
+
+    def make_env_with_recoding(i, kwargs):
+        env = make_env(**kwargs)
+        if video_folder is not None:
+            env = gym.wrappers.RecordVideo(env, video_folder/str(i), disable_logger=True)
+        return env
+
+    # lambda: make_env(i, kwargs) would not work because of late binding
+    env = gym.vector.AsyncVectorEnv([
+        functools.partial(make_env_with_recoding, i, kwargs) 
+        for i, kwargs in enumerate(make_env_kwargs)
+    ])
+    
+    limit_env_steps = env.get_attr("spec")[0].max_episode_steps
+    
+    state, _ = env.reset()
+    ep_returns = np.zeros(num_episodes, dtype=np.float32)
+    done_in_past = np.zeros(num_episodes, dtype=bool)
+    done_at_the_moment = np.zeros(num_episodes, dtype=bool)
+
+    for step in tqdm(range(limit_env_steps), "Measuring score - step"):
+        action, log_prob = agent.select_action(state)
+        state, _, terminated, truncated, infos = env.step(action)
+        done_at_the_moment = terminated | truncated
+    
+        if "final_info" in infos:
+            env_idxs = infos["_final_info"].nonzero()[0]
+            for env_idx, info in zip(env_idxs, infos["final_info"][env_idxs]):
+                ep_returns[env_idx] = info["episode"]["r"]
+        done = done_in_past | done_at_the_moment
+        done_for_first_time = done_in_past != done # this is not the same as done_at_the_moment, because of autoreset
+        done_in_past = done
+        
+        for idx in done_for_first_time.nonzero()[0]:
+            yield ep_returns[idx].item()
+
+        if done_in_past.all():
+            break
+      
+    env.close()
+
 
 class PPO(lightning.LightningModule, Agent):
     def __init__(
@@ -100,6 +157,7 @@ class PPO(lightning.LightningModule, Agent):
         entropy_limit_steps: int = -1,
         clip_grad_norm_actor: float = math.inf,
         clip_grad_norm_critic: float = math.inf,
+        video_root_folder: pathlib.Path | str | None = None,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -111,6 +169,14 @@ class PPO(lightning.LightningModule, Agent):
             self.action_dtype = torch.float32
         self.critic = Critic(architecture_dims[:-1] + [1])
         self.critic_loss_fn = getattr(torch.nn.functional, critic_loss_fn)
+        
+        if video_root_folder is not None:
+            video_root_folder = pathlib.Path(video_root_folder)
+            video_root_folder.mkdir(parents=True, exist_ok=True)
+        self.video_root_folder = video_root_folder
+
+        self.validation_scores = []
+        self.validation_start_time: float = math.nan
 
     def forward(self, x: Tensor) -> Tensor:
         return self.actor(x)
@@ -215,6 +281,59 @@ class PPO(lightning.LightningModule, Agent):
             "grad_norm/critic_unclipped": critic_grad_norm,
             "grad_norm/critic_clipped": critic_grad_norm_clipped,
         })
+    
+    def on_validation_epoch_start(self):
+        self.validation_scores.clear()
+        self.validation_start_time = time.time()
+
+    def on_validation_epoch_end(self):
+        scores = torch.tensor(self.validation_scores)
+        validation_num_seconds = time.time() - self.validation_start_time
+        self.log_simulation_metrics(scores, validation_num_seconds)
+
+    def validation_step(self, make_env_kwargs: list[dict[str, Any]], batch_idx) -> list[float]:
+        if self.video_root_folder is None:
+            video_folder = None
+        else:
+            video_folder = self.video_root_folder / f"step-{self.trainer.global_step}-batch-{batch_idx}"
+        
+        scores = list(measure_scores_parallel(self, make_env_kwargs, video_folder))
+        self.validation_scores.extend(scores)
+
+        if video_folder is not None:
+            for logger in self.loggers:
+                if isinstance(logger, lightning.pytorch.loggers.WandbLogger):
+                    for worker_dir in video_folder.glob("*"):
+                        logger.log_metrics({
+                            f"video/batch_{batch_idx}_worker_{worker_dir.name}": wandb.Video(str(video))
+                            for video in worker_dir.glob("*0.mp4")
+                        }, step=self.trainer.global_step)
+                    break
+
+        return scores
+    
+    def simulation_metrics(self, scores: Tensor, num_seconds: float | None = None) -> dict[str, float]:
+        metrics = {
+            "score/avg": scores.mean(),
+            "score/min": scores.min(),
+            "score/max": scores.max(),
+            "score/std": scores.std(),
+            "score/num_episodes": float(len(scores)),
+            "score/percentile_25": float(np.percentile(scores, 25)),
+            "score/percentile_50": float(np.percentile(scores, 50)),
+            "score/percentile_75": float(np.percentile(scores, 75))
+        }
+        if num_seconds is not None:
+            metrics["score/validation_total_num_seconds"] = num_seconds
+        return metrics
+
+    def log_simulation_metrics(self, scores: Tensor, num_seconds: float) -> None:
+        metrics = self.simulation_metrics(scores, num_seconds)
+        self.log_dict(metrics)
+        for logger in self.loggers:
+            if isinstance(logger, lightning.pytorch.loggers.WandbLogger):
+                logger.log_metrics({f"score/score": wandb.Histogram(scores)})
+
 
 
 class DataCollector:
@@ -272,7 +391,7 @@ class DataCollector:
             yield from buffer.flush()
 
 
-def get_dataloader(
+def get_train_dataloader(
     agent: Agent,
     envs: gym.vector.VectorEnv,
     buffer_size: int,
@@ -299,15 +418,44 @@ def get_dataloader(
     return loader
 
 
+def get_valid_dataloader(
+    env_kwargs: dict[str, Any],
+    valid_num_episodes: int,
+    valid_num_parallel_envs: int,
+    seed: int,
+) -> torch.utils.data.DataLoader:
+    
+    # validation loader just gives parameters for creating the gym env
+    validation_seed_gen = random.Random(seed)
+
+    validation_make_env_kwargs = []
+    for _ in range(valid_num_episodes):
+        env_kwargs_copy = env_kwargs.copy()
+        env_kwargs_copy["seed"] = validation_seed_gen.randint(0, 1000000)
+        validation_make_env_kwargs.append(env_kwargs_copy)
+        
+    return torch.utils.data.DataLoader(
+        validation_make_env_kwargs,
+        batch_size=valid_num_parallel_envs,
+        shuffle=False,
+        drop_last=False,
+        collate_fn=lambda x: x,
+    )
+    
+
 def main(
-    env_name = 'CartPole-v1',
+    env_name = 'BipedalWalker-v3',
+    device: str = "cuda",
     buffer_size: int = 1024,
     buffer_repeat: int = 5,
     batch_size: int = 64,
-    num_parallel_envs: int = 8,
-    device: str = "cuda",
-    hidden_dim: int = 64,
-    hidden_layers: int = 2,
+    train_num_parallel_envs: int = 8,
+    valid_num_parallel_envs: int = 8,
+    valid_num_episodes: int = 8,
+    validate_every_n_updates: int = 3000,
+    max_train_updates: int = -1,
+    hidden_dim: int = 128,
+    hidden_layers: int = 3,
     clip_grad_norm_actor: float = 0.5,
     clip_grad_norm_critic: float = 0.5,
     entropy_limit_steps: int = -1,
@@ -322,7 +470,7 @@ def main(
     discount_factor: float = 0.99,
     gae_lambda: float = 0.95,
     normalize_advantage: bool = True,
-    normalize_reward: bool = False,
+    normalize_reward: bool = True,
     normalize_observation: bool = False,
     clip_action: bool = True,
     clip_reward: Tuple[float, float] = (-math.inf, math.inf),
@@ -331,10 +479,18 @@ def main(
     wandb_entity: Optional[str] = None,
     wandb_group: Optional[str] = None,
     wandb_save_code: bool = True,
+    render_mode: str = "rgb_array",
+    use_early_stopping: bool = False,
+    early_stopping_patience: int = 10,
+    early_stopping_min_delta: float = 0.0,
+    validate_at_start: bool = True,
     seed: int = 0,
 ) -> None:
     if wandb_group is None:
         wandb_group = env_name
+
+    if valid_num_parallel_envs is None:
+        valid_num_parallel_envs = train_num_parallel_envs
     
     args = locals().copy()
 
@@ -344,7 +500,18 @@ def main(
     
     lightning.seed_everything(seed)
 
-    env: gym.Env = create_env(env_name, normalize_reward, normalize_observation)
+    env_kwargs = dict(
+        name=env_name,
+        normalize_reward=normalize_reward,
+        normalize_observation=normalize_observation,
+        clip_action=clip_action,
+        clip_reward=clip_reward,
+        clip_observation=clip_observation,
+        limit_env_steps=limit_env_steps,
+        render_mode=render_mode,
+    )
+
+    env: gym.Env = make_env(**env_kwargs)
     input_dim = int(np.prod(env.observation_space.shape))
     actions_are_dicrete = isinstance(env.action_space, gym.spaces.Discrete)
     if actions_are_dicrete:
@@ -352,6 +519,16 @@ def main(
     else:
         action_dim = int(np.prod(env.action_space.shape))
     architecture_dims = [input_dim] + [hidden_dim] * hidden_layers + [action_dim]
+
+    wandb_logger = lightning.pytorch.loggers.WandbLogger(
+        project=wandb_project_name,
+        save_code=wandb_save_code,
+        entity=wandb_entity,
+        group=wandb_group,
+        save_dir="./wandb",
+        tags=[env_name],
+        config={"args": args},
+    )
 
     agent = PPO(
         architecture_dims,
@@ -367,42 +544,53 @@ def main(
         optimizer_class=optimizer,
         clip_grad_norm_actor=clip_grad_norm_actor,
         clip_grad_norm_critic=clip_grad_norm_critic,
-    )
-
-    wandb_logger = lightning.pytorch.loggers.WandbLogger(
-        project=wandb_project_name,
-        save_code=wandb_save_code,
-        entity=wandb_entity,
-        group=wandb_group,
-        save_dir="./wandb",
-        tags=[env_name, agent.__class__.__name__],
-        config={"args": args},
+        video_root_folder=f"./videos/{wandb_logger.experiment.name}"
     )
 
     envs = gym.vector.AsyncVectorEnv([
-        functools.partial(
-            create_env,
-            env_name,
-            normalize_reward,
-            normalize_observation,
-            clip_action,
-            clip_reward,
-            clip_observation,
-            limit_env_steps,
-        )
-        for _ in range(num_parallel_envs)
+        functools.partial(make_env, **env_kwargs)
+        for _ in range(train_num_parallel_envs)
     ])
 
-    loader = get_dataloader(agent, envs, buffer_size, batch_size, buffer_repeat, discount_factor, gae_lambda)
+    train_loader = get_train_dataloader(agent, envs, buffer_size, batch_size, buffer_repeat, discount_factor, gae_lambda)
+    valid_loader = get_valid_dataloader(env_kwargs, valid_num_episodes, valid_num_parallel_envs, seed)
+    wandb_logger.experiment.config.update({"validation_make_env_kwargs": valid_loader.dataset})
+
+    checkpoint_callback = lightning.pytorch.callbacks.ModelCheckpoint(
+        monitor="score/avg",
+        mode="max",
+        save_last=True,
+        save_top_k=10,
+        dirpath=f"checkpoints/{wandb_logger.experiment.name}/",
+        filename="step={step}_score_avg={score/avg:.2f}",
+        auto_insert_metric_name=False,
+    )
+
+    callbacks = [checkpoint_callback]
+
+    if use_early_stopping:
+        early_stopping_callback = lightning.pytorch.callbacks.EarlyStopping(
+            monitor="score/avg",
+            mode="max",
+            patience=early_stopping_patience,
+            min_delta=early_stopping_min_delta,
+        )
+        callbacks.append(early_stopping_callback)
+
 
     trainer = lightning.Trainer(
         accelerator=device,
         max_epochs=-1,
+        max_steps=max_train_updates,
         precision="16-mixed",
         logger=wandb_logger,
+        val_check_interval=validate_every_n_updates,
+        callbacks=callbacks,
+        num_sanity_val_steps=0,
     )
-
-    trainer.fit(agent, loader)
+    if validate_at_start:
+        trainer.validate(agent, valid_loader)
+    trainer.fit(agent, train_loader, valid_loader)
     
 
 if __name__ == "__main__":
