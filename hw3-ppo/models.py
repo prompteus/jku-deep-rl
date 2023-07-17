@@ -12,15 +12,15 @@ class FeedForward(torch.nn.Module):
         layers = []
         for dim_in, dim_out in zip(dims[:-1], dims[1:]):
             layers.append(torch.nn.Linear(dim_in, dim_out))
-            layers.append(torch.nn.Tanh())
+            layers.append(torch.nn.ELU())
         layers.pop()
         self.nn = torch.nn.Sequential(*layers)
-        self.init_weights()
 
+    @torch.no_grad()
     def init_weights(self) -> None:
         for layer in self.nn.modules():
             if isinstance(layer, torch.nn.Linear):
-                torch.nn.init.orthogonal_(layer.weight, math.sqrt(2))
+                torch.nn.init.kaiming_uniform_(layer.weight)
                 torch.nn.init.zeros_(layer.bias)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -31,9 +31,12 @@ class DiscreteActor(torch.nn.Module):
     def __init__(self, dims: list[int]) -> None:
         super().__init__()
         self.nn = FeedForward(dims)
+        self.init_weights()
 
+    @torch.no_grad()
     def init_weights(self) -> None:
-        torch.nn.init.orthogonal_(self.nn.nn[-1].weight, 0.01)
+        self.nn.init_weights()
+        self.nn.nn[-1].weight /= 10
 
     def forward(self, x: torch.Tensor) -> torch.distributions.Distribution:
         logits = self.nn(x)
@@ -47,9 +50,10 @@ class ContinuousActor(torch.nn.Module):
         self.layer_sigma = torch.nn.Parameter(torch.ones(1, dims[-1]))
         self.init_weights()
 
+    @torch.no_grad()
     def init_weights(self) -> None:
-        torch.nn.init.orthogonal_(self.nn_means.nn[-1].weight, 0.01)
-        self.layer_sigma.data.fill_(1.0)
+        self.nn_means.init_weights()
+        self.layer_sigma.fill_(1.0)
 
     def forward(self, x: torch.Tensor) -> torch.distributions.Distribution:
         x = self.nn_means(x)
@@ -70,7 +74,7 @@ class Critic(torch.nn.Module):
         self.init_weights()
 
     def init_weights(self) -> None:
-        torch.nn.init.orthogonal_(self.nn.nn[-1].weight, 1.0)
+        self.nn.init_weights()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.nn(x)
@@ -84,4 +88,3 @@ class Agent(abc.ABC):
     def predict_value(self, state: np.ndarray) -> np.ndarray:
         "Returns the value of the state"
         raise NotImplementedError
-        
