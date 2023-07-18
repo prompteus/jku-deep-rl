@@ -9,4 +9,7 @@ hw1-dagger/val
 hw1-dagger/videos
 hw2-dqn/videos
 hw3-ppo/videos
+hw3-ppo/runs
+hw3-ppo/ckpts
 videos
+runs/
