@@ -1,83 +1,91 @@
 from __future__ import annotations
 import abc
-import math
 
 import numpy as np
 import torch
 
 
-class FeedForward(torch.nn.Module):
-    def __init__(self, dims: list[int]) -> None:
+class ResBlock(torch.nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        squeeze_dim: int,
+        use_skips: bool,
+        dropout: float,
+    ) -> None:
         super().__init__()
-        layers = []
-        for dim_in, dim_out in zip(dims[:-1], dims[1:]):
-            layers.append(torch.nn.Linear(dim_in, dim_out))
-            layers.append(torch.nn.ELU())
-        layers.pop()
-        self.nn = torch.nn.Sequential(*layers)
+        
+        linear_1 = torch.nn.Linear(dim, squeeze_dim)
+        linear_2 = torch.nn.Linear(squeeze_dim, dim)
+        with torch.no_grad():
+            linear_2.weight.zero_()
+            linear_2.bias.zero_()
 
-    @torch.no_grad()
-    def init_weights(self) -> None:
-        for layer in self.nn.modules():
-            if isinstance(layer, torch.nn.Linear):
-                torch.nn.init.kaiming_uniform_(layer.weight)
-                torch.nn.init.zeros_(layer.bias)
-    
+        self.nn = torch.nn.Sequential(
+            linear_1,
+            torch.nn.ELU(),
+            torch.nn.Dropout(dropout),
+            linear_2,
+            torch.nn.ELU(),
+        )
+        self.use_skip = use_skips
+        self.layer_norm = torch.nn.LayerNorm(dim)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.nn(x)
+        skip = x
+        x = self.nn(x)
+        if self.use_skip:
+            x += skip
+        x = self.layer_norm(x)
+        return x
 
 
-class DiscreteActor(torch.nn.Module):
-    def __init__(self, dims: list[int]) -> None:
-        super().__init__()
-        self.nn = FeedForward(dims)
-        self.init_weights()
+class FeedForward(torch.nn.Sequential):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        output_dim: int,
+        num_blocks: int,
+        use_skips: bool,
+        squeeze_dim: int = None,
+        dropout: float = 0.1,
+    ) -> None:
+        if squeeze_dim is None:
+            squeeze_dim = hidden_dim
+        flatten = torch.nn.Flatten()
+        linear_in = torch.nn.Linear(input_dim, hidden_dim)
+        blocks = [
+            ResBlock(hidden_dim, squeeze_dim, use_skips, dropout)
+            for _ in range(num_blocks)
+        ]
+        linear_out = torch.nn.Linear(hidden_dim, output_dim)
+        super().__init__(flatten, linear_in, *blocks, linear_out)
 
-    @torch.no_grad()
-    def init_weights(self) -> None:
-        self.nn.init_weights()
-        self.nn.nn[-1].weight /= 10
 
-    def forward(self, x: torch.Tensor) -> torch.distributions.Distribution:
-        logits = self.nn(x)
+class DiscreteActorHead(torch.nn.Module):
+    def forward(self, logits: torch.Tensor) -> torch.distributions.Distribution:
         return torch.distributions.Categorical(logits=logits)
 
 
-class ContinuousActor(torch.nn.Module):
-    def __init__(self, dims: list[int]) -> None:
+class SimpleContinuousActorHead(torch.nn.Module):
+    """
+    Simplest possible actor head for continuous action space.
+    It outputs a gaussian distribution with diagonal covariance matrix.
+    Diagonal entries (variances) are learned, but not dependent on the observation.
+    """
+    def __init__(self, action_dim: int | tuple[int]) -> None:
         super().__init__()
-        self.nn_means = FeedForward(dims)
-        self.layer_sigma = torch.nn.Parameter(torch.ones(1, dims[-1]))
-        self.init_weights()
+        if isinstance(action_dim, int):
+            action_dim = (action_dim,)
+        self.layer_sigma = torch.nn.Parameter(torch.ones(1, *action_dim))
 
-    @torch.no_grad()
-    def init_weights(self) -> None:
-        self.nn_means.init_weights()
-        self.layer_sigma.fill_(1.0)
-
-    def forward(self, x: torch.Tensor) -> torch.distributions.Distribution:
-        x = self.nn_means(x)
-        mu = torch.tanh(x)
-        sigma = self.layer_sigma.expand_as(mu)
+    def forward(self, logits_mu: torch.Tensor) -> torch.distributions.Distribution:
+        sigma = self.layer_sigma.expand_as(logits_mu)
         sigma = torch.nn.functional.softplus(sigma) + 1e-5
-        distribution = torch.distributions.Normal(loc=mu, scale=sigma)
+        distribution = torch.distributions.Normal(loc=logits_mu, scale=sigma)
         distribution = torch.distributions.Independent(distribution, 1)
-        # This is a gaussian distribution with diagonal covariance matrix
-        # log_prob will give a single value even for whole multidimensional action
         return distribution
-
-
-class Critic(torch.nn.Module):
-    def __init__(self, dims: list[int]) -> None:
-        super().__init__()
-        self.nn = FeedForward(dims)
-        self.init_weights()
-
-    def init_weights(self) -> None:
-        self.nn.init_weights()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.nn(x)
 
 
 class Agent(abc.ABC):
@@ -88,3 +96,4 @@ class Agent(abc.ABC):
     def predict_value(self, state: np.ndarray) -> np.ndarray:
         "Returns the value of the state"
         raise NotImplementedError
+

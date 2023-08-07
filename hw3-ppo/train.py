@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import time
 import random
@@ -25,7 +26,7 @@ from torch.distributions import Distribution
 from lovely_tensors import lovely
 
 from envs import make_env
-from models import Critic, DiscreteActor, ContinuousActor, Agent
+from models import DiscreteActorHead, SimpleContinuousActorHead, Agent, FeedForward
 
 
 class Transition(NamedTuple):
@@ -105,7 +106,7 @@ def measure_scores_parallel(
         return env
 
     # lambda: make_env(i, kwargs) would not work because of late binding
-    env = gym.vector.AsyncVectorEnv([
+    env = gym.vector.SyncVectorEnv([
         functools.partial(make_env_with_recoding, i, kwargs) 
         for i, kwargs in enumerate(make_env_kwargs)
     ])
@@ -142,7 +143,7 @@ def measure_scores_parallel(
 class PPO(lightning.LightningModule, Agent):
     def __init__(
         self,
-        architecture_dims: list[int],
+        backbone_config: dict[str, Any],
         actions_are_discrete: bool,
         clip_coef: float,
         lr_actor: float,
@@ -161,13 +162,17 @@ class PPO(lightning.LightningModule, Agent):
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
+
+        self.actor = torch.nn.Sequential(FeedForward(**backbone_config))
         if actions_are_discrete:
-            self.actor = DiscreteActor(architecture_dims)
+            self.actor.append(DiscreteActorHead())
             self.action_dtype = torch.long
         else:
-            self.actor = ContinuousActor(architecture_dims)
+            self.actor.append(SimpleContinuousActorHead(action_dim=backbone_config["output_dim"]))
             self.action_dtype = torch.float32
-        self.critic = Critic(architecture_dims[:-1] + [1])
+
+        backbone_config["output_dim"] = 1
+        self.critic = FeedForward(**backbone_config)
         self.critic_loss_fn = getattr(torch.nn.functional, critic_loss_fn)
         
         if video_root_folder is not None:
@@ -420,19 +425,14 @@ def get_train_dataloader(
 
 def get_valid_dataloader(
     env_kwargs: dict[str, Any],
-    valid_num_episodes: int,
+    env_options: list[dict[str, Any]],
     valid_num_parallel_envs: int,
-    seed: int,
 ) -> torch.utils.data.DataLoader:
-    
-    # validation loader just gives parameters for creating the gym env
-    validation_seed_gen = random.Random(seed)
 
-    validation_make_env_kwargs = []
-    for _ in range(valid_num_episodes):
-        env_kwargs_copy = env_kwargs.copy()
-        env_kwargs_copy["seed"] = validation_seed_gen.randint(0, 1000000)
-        validation_make_env_kwargs.append(env_kwargs_copy)
+    validation_make_env_kwargs = [
+        {**env_kwargs, "options": options}
+        for options in env_options
+    ]
         
     return torch.utils.data.DataLoader(
         validation_make_env_kwargs,
@@ -441,7 +441,20 @@ def get_valid_dataloader(
         drop_last=False,
         collate_fn=lambda x: x,
     )
-    
+
+
+def load_env_options(path: pathlib.Path | None, num_envs: int | None) -> list[dict[str, Any]]:
+    if path is None:
+        return [{} for _ in range(num_envs)]
+    with open(path, "r") as f:
+        env_options = json.load(f)
+    if isinstance(env_options, list) and num_envs is not None:
+        if len(env_options) != num_envs:
+            raise ValueError(f"Number of env options ({len(env_options)}) does not match num_envs ({num_envs})")
+    if isinstance(env_options, dict):
+        env_options = [env_options for _ in range(num_envs)]
+    return env_options
+
 
 def main(
     env_name = 'BipedalWalker-v3',
@@ -449,13 +462,16 @@ def main(
     buffer_size: int = 1024,
     buffer_repeat: int = 5,
     batch_size: int = 64,
-    train_num_parallel_envs: int = 8,
+    train_num_parallel_envs: Optional[int] = None,
     valid_num_parallel_envs: int = 16,
-    valid_num_episodes: int = 48,
-    validate_every_n_updates: int = 32000,
+    valid_num_episodes: Optional[int] = None,
+    validate_every_n_updates: int = 50000,
     max_train_updates: int = -1,
+    num_blocks: int = 6,
     hidden_dim: int = 128,
-    hidden_layers: int = 3,
+    squeeze_dim: Optional[int] = 64,
+    use_skip_connection: bool = True,
+    dropout: float = 0.1,
     clip_grad_norm_actor: float = 0.5,
     clip_grad_norm_critic: float = 0.5,
     entropy_limit_steps: int = -1,
@@ -480,18 +496,28 @@ def main(
     wandb_group: Optional[str] = None,
     wandb_save_code: bool = True,
     render_mode: str = "rgb_array",
+    stack_frames: Optional[int] = 6,
     use_early_stopping: bool = False,
     early_stopping_patience: int = 10,
     early_stopping_min_delta: float = 0.0,
     validate_at_start: bool = True,
     seed: int = 0,
+    train_env_options_json: Optional[pathlib.Path] = None,
+    valid_env_options_json: Optional[pathlib.Path] = None,
 ) -> None:
     if wandb_group is None:
         wandb_group = env_name
+    
+    train_env_options = load_env_options(train_env_options_json, train_num_parallel_envs)
 
+    if train_num_parallel_envs is None:
+        train_num_parallel_envs = len(train_env_options)
+    
     if valid_num_parallel_envs is None:
         valid_num_parallel_envs = train_num_parallel_envs
-    
+
+    valid_env_options = load_env_options(valid_env_options_json, valid_num_episodes)
+
     args = locals().copy()
 
     if device == "cuda":
@@ -500,7 +526,7 @@ def main(
     
     lightning.seed_everything(seed)
 
-    env_kwargs = dict(
+    make_env_kwargs = dict(
         name=env_name,
         normalize_reward=normalize_reward,
         normalize_observation=normalize_observation,
@@ -508,17 +534,27 @@ def main(
         clip_reward=clip_reward,
         clip_observation=clip_observation,
         limit_env_steps=limit_env_steps,
+        stack_frames=stack_frames,
         render_mode=render_mode,
     )
 
-    env: gym.Env = make_env(**env_kwargs)
+    env: gym.Env = make_env(**make_env_kwargs, options=train_env_options[0])
     input_dim = int(np.prod(env.observation_space.shape))
     actions_are_dicrete = isinstance(env.action_space, gym.spaces.Discrete)
     if actions_are_dicrete:
         action_dim = env.action_space.n
     else:
         action_dim = int(np.prod(env.action_space.shape))
-    architecture_dims = [input_dim] + [hidden_dim] * hidden_layers + [action_dim]
+
+    backbone_config = dict(
+        input_dim=input_dim,
+        hidden_dim=hidden_dim,
+        squeeze_dim=squeeze_dim,
+        output_dim=action_dim,
+        num_blocks=num_blocks,
+        use_skips=use_skip_connection,
+        dropout=dropout,
+    )
 
     wandb_logger = lightning.pytorch.loggers.WandbLogger(
         project=wandb_project_name,
@@ -531,7 +567,7 @@ def main(
     )
 
     agent = PPO(
-        architecture_dims,
+        backbone_config,
         actions_are_dicrete,
         clip_coef,
         lr_actor,
@@ -547,13 +583,13 @@ def main(
         video_root_folder=f"./videos/{wandb_logger.experiment.name}"
     )
 
-    envs = gym.vector.AsyncVectorEnv([
-        functools.partial(make_env, **env_kwargs)
-        for _ in range(train_num_parallel_envs)
+    envs = gym.vector.SyncVectorEnv([
+        functools.partial(make_env, **make_env_kwargs, options=options)
+        for options in train_env_options
     ])
 
     train_loader = get_train_dataloader(agent, envs, buffer_size, batch_size, buffer_repeat, discount_factor, gae_lambda)
-    valid_loader = get_valid_dataloader(env_kwargs, valid_num_episodes, valid_num_parallel_envs, seed)
+    valid_loader = get_valid_dataloader(make_env_kwargs, valid_env_options, valid_num_parallel_envs)
     wandb_logger.experiment.config.update({"validation_make_env_kwargs": valid_loader.dataset})
 
     checkpoint_callback = lightning.pytorch.callbacks.ModelCheckpoint(
@@ -577,7 +613,6 @@ def main(
         )
         callbacks.append(early_stopping_callback)
 
-
     trainer = lightning.Trainer(
         accelerator=device,
         max_epochs=-1,
@@ -588,6 +623,7 @@ def main(
         callbacks=callbacks,
         num_sanity_val_steps=0,
     )
+
     if validate_at_start:
         trainer.validate(agent, valid_loader)
     trainer.fit(agent, train_loader, valid_loader)
